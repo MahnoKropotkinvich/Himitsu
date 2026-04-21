@@ -1,0 +1,60 @@
+[workspace]
+members = [".", "crates/cifer-sys", "crates/himitsu-trace"]
+resolver = "2"
+
+[package]
+name = "himitsu"
+version = "0.1.0"
+description = "Broadcast encryption key management with traitor tracing"
+authors = ["you"]
+edition = "2021"
+
+[lib]
+name = "himitsu_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Database
+rocksdb = { version = "0.22", default-features = false, features = ["snappy"] }
+bincode = "1"
+
+# GPG (OpenPGP)
+pgp = "0.14"
+
+# Broadcast encryption
+cosmian_cover_crypt = "16"
+cosmian_crypto_core = "=11.0.0"
+aes-gcm = "0.10"
+
+# File type detection
+infer = "0.16"
+open = "5"
+
+# Utilities
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "=1.11.1", features = ["v4"] }
+rand = "0.8"
+thiserror = "2"
+zeroize = { version = "1", features = ["derive"] }
+dirs = "6"
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+num-bigint = "0.4"
+num-traits = "0.2"
+base64 = "0.22"
+hex = "0.4"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CiFEr FFI
+cifer-sys = { path = "crates/cifer-sys" }

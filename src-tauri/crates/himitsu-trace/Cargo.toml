@@ -1,0 +1,29 @@
+[package]
+name = "himitsu-trace"
+version = "0.1.0"
+edition = "2021"
+description = "Standalone traitor tracing CLI tool for Himitsu"
+
+[[bin]]
+name = "himitsu-trace"
+path = "src/main.rs"
+
+[dependencies]
+# Shared crypto primitives
+cifer-sys = { path = "../cifer-sys" }
+
+# Data access (read-only access to the ledger DB)
+rocksdb = { version = "0.22", default-features = false, features = ["snappy"] }
+bincode = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Fingerprint math
+num-bigint = "0.4"
+num-traits = "0.2"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+hex = "0.4"
+thiserror = "2"

@@ -1,0 +1,16 @@
+[package]
+name = "cifer-sys"
+version = "0.1.0"
+edition = "2021"
+description = "FFI bindings to CiFEr (Functional Encryption library in C)"
+links = "cifer"
+
+[features]
+default = []
+cifer-linked = []
+
+[build-dependencies]
+cc = "1"
+bindgen = "0.71"
+
+[dependencies]
