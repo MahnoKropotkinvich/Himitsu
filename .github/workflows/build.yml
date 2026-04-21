@@ -26,7 +26,7 @@ jobs:
             artifact_dir: bundle/deb
 
           - os: windows-latest
-            target: x86_64-pc-windows-gnu
+            target: x86_64-pc-windows-msvc
             artifact: 'himitsu_*_x64-setup.exe'
             artifact_dir: bundle/nsis
 
@@ -85,36 +85,22 @@ jobs:
         run: |
           brew install gmp libsodium
 
-      # ── Windows system deps (MSYS2) ───────────────────────────
-      - name: Setup MSYS2 (Windows)
+      # ── Windows system deps (vcpkg + cache) ─────────────────
+      - name: Set VCPKG_ROOT (Windows)
         if: runner.os == 'Windows'
-        uses: msys2/setup-msys2@v2
-        with:
-          msystem: MINGW64
-          update: false
-          install: >-
-            mingw-w64-x86_64-gcc
-            mingw-w64-x86_64-gmp
-            mingw-w64-x86_64-libsodium
-            mingw-w64-x86_64-openssl
+        shell: bash
+        run: echo "VCPKG_ROOT=$VCPKG_INSTALLATION_ROOT" >> $GITHUB_ENV
 
-      - name: Set MSYS2 env (Windows)
+      - name: Cache vcpkg installed packages (Windows)
         if: runner.os == 'Windows'
-        shell: msys2 {0}
-        run: |
-          MINGW_PREFIX=$(cygpath -m /mingw64)
-          echo "GMP_LIB_DIR=${MINGW_PREFIX}/lib"                              >> $GITHUB_ENV
-          echo "GMP_INCLUDE_DIR=${MINGW_PREFIX}/include"                      >> $GITHUB_ENV
-          echo "SODIUM_LIB_DIR=${MINGW_PREFIX}/lib"                           >> $GITHUB_ENV
-          echo "SODIUM_INCLUDE_DIR=${MINGW_PREFIX}/include"                   >> $GITHUB_ENV
-          echo "SODIUM_STATIC=1"                                              >> $GITHUB_ENV
-          echo "OPENSSL_DIR=${MINGW_PREFIX}"                                  >> $GITHUB_ENV
-          echo "OPENSSL_INCLUDE_DIR=${MINGW_PREFIX}/include"                  >> $GITHUB_ENV
-          echo "OPENSSL_LIB_DIR=${MINGW_PREFIX}/lib"                          >> $GITHUB_ENV
-          echo "CC_x86_64_pc_windows_gnu=${MINGW_PREFIX}/bin/gcc.exe"         >> $GITHUB_ENV
-          echo "AR_x86_64_pc_windows_gnu=${MINGW_PREFIX}/bin/ar.exe"          >> $GITHUB_ENV
-          echo "${MINGW_PREFIX}/bin"                                          >> $GITHUB_PATH
-          echo "PKG_CONFIG_PATH=${MINGW_PREFIX}/lib/pkgconfig"                >> $GITHUB_ENV
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.VCPKG_INSTALLATION_ROOT }}/installed
+          key: vcpkg-x64-windows-static-md-openssl
+
+      - name: Install OpenSSL via vcpkg (Windows)
+        if: runner.os == 'Windows'
+        run: vcpkg install openssl:x64-windows-static-md
 
       # ── CiFEr git submodule ────────────────────────────────────
       - name: Update CiFEr submodule
@@ -151,4 +137,3 @@ jobs:
           name: himitsu-${{ matrix.target }}-rpm
           path: src-tauri/target/${{ matrix.target }}/release/bundle/rpm/himitsu-*.rpm
           retention-days: 30
-
