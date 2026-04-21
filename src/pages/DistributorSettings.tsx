@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { save } from "@tauri-apps/plugin-dialog";
 
 interface Applicant {
   user_id: string;
@@ -42,17 +43,16 @@ export default function DistributorSettings() {
 
   const downloadKey = async (user: Applicant) => {
     try {
-      const blob: number[] = await invoke("download_user_key", { userId: user.user_id });
-      const bytes = new Uint8Array(blob);
-      const file = new Blob([bytes], { type: "application/pgp-encrypted" });
-      const url = URL.createObjectURL(file);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `${user.display_name.replace(/\s+/g, "_")}_key.pgp`;
-      a.click();
-      URL.revokeObjectURL(url);
+      const dest = await save({
+        title: "Save subscriber key",
+        defaultPath: `${user.display_name.replace(/\s+/g, "_")}_key.pgp`,
+        filters: [{ name: "PGP Encrypted Key", extensions: ["pgp"] }, { name: "All files", extensions: ["*"] }],
+      });
+      if (!dest) return;
+      await invoke("export_user_key", { userId: user.user_id, destPath: dest });
+      setStatus({ ok: true, msg: `Key saved to ${dest}` });
     } catch (e: any) {
-      setStatus({ ok: false, msg: `Download failed: ${e}` });
+      setStatus({ ok: false, msg: `Export failed: ${e}` });
     }
   };
 

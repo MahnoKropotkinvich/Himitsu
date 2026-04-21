@@ -51,6 +51,7 @@ pub fn run() {
             commands::broadcast::set_user_revoked,
             commands::broadcast::delete_user,
             commands::broadcast::download_user_key,
+            commands::broadcast::export_user_key,
             commands::gpg::import_gpg_public_key,
             commands::gpg::list_gpg_keys,
             commands::decrypt::decrypt_content,

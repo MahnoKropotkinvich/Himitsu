@@ -117,8 +117,6 @@ jobs:
           releaseBody: 'See the assets below to download this version of Himitsu.'
           releaseDraft: true
           prerelease: false
-          appName: Himitsu
-          appVersion: ${{ github.ref_name }}
           args: --target ${{ matrix.target }}
           tauriScript: npm run tauri
 
@@ -136,4 +134,12 @@ jobs:
         with:
           name: himitsu-${{ matrix.target }}-rpm
           path: src-tauri/target/${{ matrix.target }}/release/bundle/rpm/himitsu-*.rpm
+          retention-days: 30
+
+      - name: Upload AppImage (Linux only)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: actions/upload-artifact@v4
+        with:
+          name: himitsu-${{ matrix.target }}-appimage
+          path: src-tauri/target/${{ matrix.target }}/release/bundle/appimage/himitsu_*.AppImage
           retention-days: 30

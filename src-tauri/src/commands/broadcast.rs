@@ -328,6 +328,23 @@ pub fn download_user_key(
         .ok_or_else(|| "Encrypted key not found for this user".to_string())
 }
 
+/// Export a user's GPG-encrypted key to a file on disk.
+#[tauri::command]
+pub fn export_user_key(
+    user_id: String,
+    dest_path: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    let db = state.db.lock().unwrap();
+    let blob = db.get_cf(CF_ENCRYPTED_KEYS, user_id.as_bytes())
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Encrypted key not found for this user".to_string())?;
+    std::fs::write(&dest_path, &blob)
+        .map_err(|e| format!("Failed to write key file: {e}"))?;
+    tracing::info!(user_id = %user_id, dest = %dest_path, "User key exported");
+    Ok(())
+}
+
 /// Permanently delete a subscriber and all associated data:
 /// GPG key, user key, fingerprint vector, and ledger entries.
 #[tauri::command]
