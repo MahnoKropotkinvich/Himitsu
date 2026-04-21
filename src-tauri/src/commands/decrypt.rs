@@ -17,9 +17,10 @@ pub fn decrypt_content(
 ) -> std::result::Result<DecryptResult, String> {
     use base64::Engine;
 
-    let db = state.db.lock().unwrap();
-    let rk = super::keys::load_active_rk(&db)?;
-    drop(db);
+    let rk = {
+        let db = state.db.lock().unwrap();
+        super::keys::load_active_rk(&db)?
+    };
 
     let ct_bytes = base64::engine::general_purpose::STANDARD
         .decode(&ciphertext_base64)
@@ -76,9 +77,10 @@ pub fn decrypt_and_open(
 ) -> std::result::Result<DecryptResult, String> {
     use base64::Engine;
 
-    let db = state.db.lock().unwrap();
-    let rk = super::keys::load_active_rk(&db)?;
-    drop(db);
+    let rk = {
+        let db = state.db.lock().unwrap();
+        super::keys::load_active_rk(&db)?
+    };
 
     let ct_bytes = base64::engine::general_purpose::STANDARD
         .decode(&ciphertext_base64)
@@ -123,9 +125,10 @@ pub fn decrypt_file(
 ) -> std::result::Result<DecryptFileResult, String> {
     use base64::Engine;
 
-    let db = state.db.lock().unwrap();
-    let rk = super::keys::load_active_rk(&db)?;
-    drop(db);
+    let rk = {
+        let db = state.db.lock().unwrap();
+        super::keys::load_active_rk(&db)?
+    };
 
     let ct_bytes = std::fs::read(&input_path)
         .map_err(|e| format!("Failed to read ciphertext file: {e}"))?;
@@ -232,9 +235,10 @@ pub fn decrypt_to_folder(
     input_path: String,
     state: State<'_, AppState>,
 ) -> std::result::Result<DecryptFileResult, String> {
-    let db = state.db.lock().unwrap();
-    let rk = super::keys::load_active_rk(&db)?;
-    drop(db);
+    let rk = {
+        let db = state.db.lock().unwrap();
+        super::keys::load_active_rk(&db)?
+    };
 
     let ct_bytes = std::fs::read(&input_path)
         .map_err(|e| format!("Failed to read ciphertext file: {e}"))?;
