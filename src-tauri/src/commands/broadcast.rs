@@ -244,7 +244,7 @@ pub fn import_and_assign(
     // 1. Parse GPG key
     let gpg_pub = gpg_ops::parse_public_key(&armored_key).map_err(|e| e.to_string())?;
     let fp = gpg_ops::fingerprint_hex(&gpg_pub);
-    let user_id = fp.clone();
+    let user_id = uuid::Uuid::new_v4().to_string();
 
     tracing::info!(
         user_id = %user_id,
@@ -367,14 +367,23 @@ pub fn delete_user(
 
     Ok(())
 }
+/// Result of a revoke/restore operation.
+/// `refreshed_users` lists the display names of users whose keys were
+/// updated server-side and need to be redistributed.
+#[derive(Debug, Clone, Serialize)]
+pub struct SetRevokedResult {
+    pub refreshed_users: Vec<String>,
+}
+
 #[tauri::command]
 pub fn set_user_revoked(
     user_id: String,
     revoked: bool,
     state: State<'_, AppState>,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<SetRevokedResult, String> {
     let db = state.db.lock().unwrap();
 
+    // -- 1. Flip the revoked flag ----------------------------------------
     let raw = db
         .get_cf(CF_GPG_KEYS, user_id.as_bytes())
         .map_err(|e| e.to_string())?
@@ -387,15 +396,20 @@ pub fn set_user_revoked(
     db.put_cf(CF_GPG_KEYS, user_id.as_bytes(), &data)
         .map_err(|e| e.to_string())?;
 
+    // -- 2. Load MSK -----------------------------------------------------
+    let mut msk_bytes = db
+        .get_cf(CF_MASTER_KEYS, b"msk")
+        .map_err(|e| e.to_string())?
+        .ok_or("Not initialized")?;
+
+    // -- 3. Revoke: rekey, then refresh all NON-revoked users ------------
+    //    Restore: refresh only the restored user (they get new epoch keys)
     if revoked {
-        // Rekey to actually revoke their crypto access
-        let msk_bytes = db
-            .get_cf(CF_MASTER_KEYS, b"msk")
-            .map_err(|e| e.to_string())?
-            .ok_or("Not initialized")?;
+        // Rekey creates a new epoch — old USKs can't decrypt new content
         let updated_kp = cover_crypt_ops::rekey(&msk_bytes, "Access::Broadcast")
             .map_err(|e| e.to_string())?;
-        db.put_cf(CF_MASTER_KEYS, b"msk", &updated_kp.master_secret_key)
+        msk_bytes = updated_kp.master_secret_key;
+        db.put_cf(CF_MASTER_KEYS, b"msk", &msk_bytes)
             .map_err(|e| e.to_string())?;
         db.put_cf(CF_MASTER_KEYS, b"mpk", &updated_kp.public_key)
             .map_err(|e| e.to_string())?;
@@ -411,5 +425,81 @@ pub fn set_user_revoked(
         .map_err(|e| e.to_string())?;
     }
 
-    Ok(())
+    // -- 4. Refresh USKs for eligible users ------------------------------
+    let mut refreshed_users: Vec<String> = Vec::new();
+
+    let all_users = db.iter_cf(CF_GPG_KEYS).map_err(|e| e.to_string())?;
+    let mut users_to_refresh: Vec<crate::storage::models::Applicant> = Vec::new();
+    for (_k, v) in all_users {
+        if let Ok(a) = bincode::deserialize::<crate::storage::models::Applicant>(&v) {
+            if a.revoked {
+                continue; // skip revoked users
+            }
+            if revoked && a.user_id == user_id {
+                continue; // skip the user we just revoked
+            }
+            // On restore: refresh only the restored user
+            // On revoke:  refresh all remaining non-revoked users
+            if !revoked && a.user_id != user_id {
+                continue;
+            }
+            users_to_refresh.push(a);
+        }
+    }
+
+    for user in &users_to_refresh {
+        // Load their stored USK
+        let usk_record_bytes = match db
+            .get_cf(CF_USER_KEYS, user.user_id.as_bytes())
+            .map_err(|e| e.to_string())?
+        {
+            Some(b) => b,
+            None => {
+                tracing::warn!(user_id = %user.user_id, "No USK found, skipping refresh");
+                continue;
+            }
+        };
+        let mut wrapped: crate::crypto::cover_crypt_ops::WrappedUserKey =
+            bincode::deserialize(&usk_record_bytes).map_err(|e| e.to_string())?;
+
+        // Refresh USK — keep old secrets so they can still decrypt old ciphertexts
+        let (new_msk, new_usk) =
+            cover_crypt_ops::refresh_user_key(&msk_bytes, &wrapped.key_data, true)
+                .map_err(|e| e.to_string())?;
+        msk_bytes = new_msk;
+        wrapped.key_data = new_usk;
+
+        // Persist updated USK
+        let usk_data = bincode::serialize(&wrapped).map_err(|e| e.to_string())?;
+        db.put_cf(CF_USER_KEYS, user.user_id.as_bytes(), &usk_data)
+            .map_err(|e| e.to_string())?;
+
+        // Re-wrap with GPG and update encrypted key store
+        let gpg_pub = gpg_ops::parse_public_key(&user.gpg_public_key_armored)
+            .map_err(|e| e.to_string())?;
+        let encrypted_usk = key_mgmt::wrap_user_key_with_gpg(&wrapped.key_data, &gpg_pub)
+            .map_err(|e| e.to_string())?;
+        db.put_cf(CF_ENCRYPTED_KEYS, user.user_id.as_bytes(), &encrypted_usk)
+            .map_err(|e| e.to_string())?;
+
+        // Ledger
+        distributor::record(
+            &db,
+            &user.user_id,
+            &user.gpg_fingerprint,
+            LedgerAction::KeyRefreshed,
+            vec!["Access::Broadcast".into()],
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+
+        refreshed_users.push(user.display_name.clone());
+        tracing::info!(user_id = %user.user_id, "USK refreshed and re-wrapped");
+    }
+
+    // Persist final MSK state (refresh_usk may mutate it)
+    db.put_cf(CF_MASTER_KEYS, b"msk", &msk_bytes)
+        .map_err(|e| e.to_string())?;
+
+    Ok(SetRevokedResult { refreshed_users })
 }
