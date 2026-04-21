@@ -1,0 +1,24 @@
+# Maintainer: Your Name <your@email.com>
+pkgname=himitsu-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Broadcast encryption key management with traitor tracing"
+arch=('x86_64')
+url="https://github.com/OWNER/Himitsu"
+license=('MIT')
+depends=(
+    'webkit2gtk-4.1'
+    'gtk3'
+    'libayatana-appindicator'
+)
+provides=('himitsu')
+conflicts=('himitsu')
+options=('!strip')
+
+source_x86_64=("${pkgname}-${pkgver}.AppImage::https://github.com/OWNER/Himitsu/releases/download/v${pkgver}/himitsu_${pkgver}_amd64.AppImage")
+sha256sums_x86_64=('SKIP')
+
+package() {
+    install -Dm755 "${srcdir}/${pkgname}-${pkgver}.AppImage" \
+        "${pkgdir}/usr/bin/himitsu"
+}

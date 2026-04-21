@@ -26,7 +26,7 @@ jobs:
             artifact_dir: bundle/deb
 
           - os: windows-latest
-            target: x86_64-pc-windows-msvc
+            target: x86_64-pc-windows-gnu
             artifact: 'himitsu_*_x64-setup.exe'
             artifact_dir: bundle/nsis
 
@@ -85,20 +85,36 @@ jobs:
         run: |
           brew install gmp libsodium
 
-      # ── Windows system deps ────────────────────────────────────
-      - name: Windows system dependencies (vcpkg)
+      # ── Windows system deps (MSYS2) ───────────────────────────
+      - name: Setup MSYS2 (Windows)
         if: runner.os == 'Windows'
-        run: |
-          vcpkg install gmp libsodium --triplet x64-windows-static-md
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-gmp
+            mingw-w64-x86_64-libsodium
+            mingw-w64-x86_64-openssl
 
-      - name: Set VCPKG env (Windows)
+      - name: Set MSYS2 env (Windows)
         if: runner.os == 'Windows'
-        shell: bash
+        shell: msys2 {0}
         run: |
-          echo "VCPKG_ROOT=$VCPKG_INSTALLATION_ROOT" >> $GITHUB_ENV
-          echo "GMP_LIB_DIR=$VCPKG_INSTALLATION_ROOT/installed/x64-windows-static-md/lib" >> $GITHUB_ENV
-          echo "SODIUM_LIB_DIR=$VCPKG_INSTALLATION_ROOT/installed/x64-windows-static-md/lib" >> $GITHUB_ENV
-          echo "SODIUM_STATIC=1" >> $GITHUB_ENV
+          MINGW_PREFIX=$(cygpath -m /mingw64)
+          echo "GMP_LIB_DIR=${MINGW_PREFIX}/lib"                              >> $GITHUB_ENV
+          echo "GMP_INCLUDE_DIR=${MINGW_PREFIX}/include"                      >> $GITHUB_ENV
+          echo "SODIUM_LIB_DIR=${MINGW_PREFIX}/lib"                           >> $GITHUB_ENV
+          echo "SODIUM_INCLUDE_DIR=${MINGW_PREFIX}/include"                   >> $GITHUB_ENV
+          echo "SODIUM_STATIC=1"                                              >> $GITHUB_ENV
+          echo "OPENSSL_DIR=${MINGW_PREFIX}"                                  >> $GITHUB_ENV
+          echo "OPENSSL_INCLUDE_DIR=${MINGW_PREFIX}/include"                  >> $GITHUB_ENV
+          echo "OPENSSL_LIB_DIR=${MINGW_PREFIX}/lib"                          >> $GITHUB_ENV
+          echo "CC_x86_64_pc_windows_gnu=${MINGW_PREFIX}/bin/gcc.exe"         >> $GITHUB_ENV
+          echo "AR_x86_64_pc_windows_gnu=${MINGW_PREFIX}/bin/ar.exe"          >> $GITHUB_ENV
+          echo "${MINGW_PREFIX}/bin"                                          >> $GITHUB_PATH
+          echo "PKG_CONFIG_PATH=${MINGW_PREFIX}/lib/pkgconfig"                >> $GITHUB_ENV
 
       # ── CiFEr git submodule ────────────────────────────────────
       - name: Update CiFEr submodule
@@ -109,8 +125,6 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Point pkg-config at vcpkg on Windows
-          PKG_CONFIG_PATH: ${{ runner.os == 'Windows' && format('{0}/installed/x64-windows-static-md/lib/pkgconfig', env.VCPKG_ROOT) || '' }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: Himitsu ${{ github.ref_name }}
@@ -120,6 +134,7 @@ jobs:
           appName: Himitsu
           appVersion: ${{ github.ref_name }}
           args: --target ${{ matrix.target }}
+          tauriScript: npm run tauri
 
       # ── Upload artifacts ───────────────────────────────────────
       - name: Upload bundle
@@ -128,3 +143,12 @@ jobs:
           name: himitsu-${{ matrix.target }}
           path: src-tauri/target/${{ matrix.target }}/release/${{ matrix.artifact_dir }}/${{ matrix.artifact }}
           retention-days: 30
+
+      - name: Upload RPM (Linux only)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: actions/upload-artifact@v4
+        with:
+          name: himitsu-${{ matrix.target }}-rpm
+          path: src-tauri/target/${{ matrix.target }}/release/bundle/rpm/himitsu-*.rpm
+          retention-days: 30
+

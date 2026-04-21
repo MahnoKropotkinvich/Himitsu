@@ -37,6 +37,10 @@ pub struct BroadcastCiphertext {
     pub ciphertext: Vec<u8>,
     pub nonce: Vec<u8>,
     pub policy: String,
+    /// Whether the plaintext was zstd-compressed before encryption.
+    /// Defaults to false for backward compatibility with old ciphertexts.
+    #[serde(default)]
+    pub compressed: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -150,8 +154,9 @@ pub fn generate_user_key(
 
 /// Encrypt plaintext under an access policy.
 ///
-/// Returns a `BroadcastCiphertext` containing the CoverCrypt header and
-/// AES-256-GCM encrypted payload.
+/// The plaintext is zstd-compressed before encryption to reduce ciphertext
+/// size.  Returns a `BroadcastCiphertext` containing the CoverCrypt header
+/// and AES-256-GCM encrypted payload.
 pub fn encrypt(
     mpk_bytes: &[u8],
     policy_str: &str,
@@ -164,6 +169,17 @@ pub fn encrypt(
     let mpk = de_mpk(mpk_bytes)?;
     let ap = AccessPolicy::parse(policy_str).map_err(map_cc_err)?;
 
+    // 0. Compress plaintext with zstd (level 3 = good balance)
+    let compressed = zstd::encode_all(plaintext, 3)
+        .map_err(|e| HimitsuError::Broadcast(format!("zstd compress failed: {e}")))?;
+
+    tracing::debug!(
+        original = plaintext.len(),
+        compressed = compressed.len(),
+        ratio = format!("{:.1}%", compressed.len() as f64 / plaintext.len().max(1) as f64 * 100.0),
+        "zstd compression"
+    );
+
     // 1. Generate encrypted header encapsulating a shared secret
     let (secret, encrypted_header) =
         EncryptedHeader::generate(&cc, &mpk, &ap, None, None)
@@ -175,7 +191,7 @@ pub fn encrypt(
     let nonce_bytes: [u8; 12] = rand::random();
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ciphertext = cipher
-        .encrypt(nonce, plaintext)
+        .encrypt(nonce, compressed.as_ref())
         .map_err(|e| HimitsuError::Broadcast(format!("AES-GCM encrypt failed: {e}")))?;
 
     Ok(BroadcastCiphertext {
@@ -183,10 +199,15 @@ pub fn encrypt(
         ciphertext,
         nonce: nonce_bytes.to_vec(),
         policy: policy_str.to_string(),
+        compressed: true,
     })
 }
 
 /// Decrypt a `BroadcastCiphertext` using a user secret key.
+///
+/// If the ciphertext was compressed (all new ciphertexts are), the plaintext
+/// is automatically zstd-decompressed.  Old uncompressed ciphertexts are
+/// handled transparently.
 ///
 /// Returns the plaintext bytes, or an error if the user's access policy
 /// does not satisfy the encryption policy.
@@ -215,11 +236,23 @@ pub fn decrypt(
     let key = Key::<Aes256Gcm>::from_slice(&*cleartext_header.secret);
     let cipher = Aes256Gcm::new(key);
     let nonce = Nonce::from_slice(&broadcast_ct.nonce);
-    let plaintext = cipher
+    let decrypted = cipher
         .decrypt(nonce, broadcast_ct.ciphertext.as_ref())
         .map_err(|e| HimitsuError::Decryption(format!("AES-GCM decrypt failed: {e}")))?;
 
-    Ok(plaintext)
+    // 3. Decompress if needed
+    if broadcast_ct.compressed {
+        let plaintext = zstd::decode_all(decrypted.as_slice())
+            .map_err(|e| HimitsuError::Decryption(format!("zstd decompress failed: {e}")))?;
+        tracing::debug!(
+            compressed = decrypted.len(),
+            decompressed = plaintext.len(),
+            "zstd decompression"
+        );
+        Ok(plaintext)
+    } else {
+        Ok(decrypted)
+    }
 }
 
 /// Rekey (revoke) all attributes matching the given access policy.

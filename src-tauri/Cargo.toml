@@ -44,6 +44,7 @@ uuid = { version = "=1.11.1", features = ["v4"] }
 rand = "0.8"
 thiserror = "2"
 zeroize = { version = "1", features = ["derive"] }
+zstd = "0.13"
 dirs = "6"
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
