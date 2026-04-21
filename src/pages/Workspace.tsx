@@ -156,16 +156,15 @@ export default function Workspace({ uskB64 }: { uskB64: string }) {
         ciphertextJsonBase64: uint8ToBase64(rightData),
         userSecretKeyBase64: uskB64,
       });
-      if (result.success && result.render.kind === "Inline") {
+      if (!result.success) {
+        setDialog(`Decryption failed:\n${result.message}`);
+        return;
+      }
+      if (result.render.kind === "Inline") {
         const bytes = base64ToUint8(result.render.data_base64);
         setLeftData(bytes);
         setLeftMime(result.render.mime);
         setLeftName("decrypted." + result.render.extension);
-      } else if (result.success && result.render.kind === "External") {
-        // Already opened externally
-        setLeftData(null); setLeftName(""); setLeftMime("");
-      } else if (!result.success) {
-        setDialog(`Decryption failed:\n${result.message}`);
       }
     } catch (e: any) {
       setDialog(`Decryption failed:\n${e}`);
@@ -206,11 +205,14 @@ export default function Workspace({ uskB64 }: { uskB64: string }) {
           >
             {leftData ? (
               <>
-                <button className="btn btn-outline btn-sm clear-btn" onClick={(e) => { e.stopPropagation(); clearLeft(); }}>Clear</button>
+                <div className="drop-zone-actions">
+                  <button className="btn btn-outline btn-sm" onClick={(e) => { e.stopPropagation(); downloadFile(leftData!, leftName || "plaintext.bin"); }}>Save</button>
+                  <button className="btn btn-outline btn-sm" onClick={(e) => { e.stopPropagation(); clearLeft(); }}>Clear</button>
+                </div>
                 {leftRenderable ? (
                   <PlaintextPreview data={leftData} mime={leftMime} />
                 ) : (
-                  <BinaryInfo size={leftData.length} name={leftName} onDownload={() => downloadFile(leftData!, leftName || "plaintext.bin")} />
+                  <BinaryInfo size={leftData.length} name={leftName} />
                 )}
               </>
             ) : (

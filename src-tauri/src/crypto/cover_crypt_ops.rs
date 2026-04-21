@@ -30,17 +30,24 @@ pub struct WrappedUserKey {
     pub key_data: Vec<u8>,
 }
 
-/// Encrypted payload: header (CoverCrypt encapsulation) + AES-GCM ciphertext.
+/// 1 MiB chunk size for parallel AES-GCM.
+const CHUNK_SIZE: usize = 1 << 20;
+
+/// Encrypted payload: header (CoverCrypt encapsulation) + chunked AES-GCM ciphertext.
+///
+/// Serialized with bincode for compact binary representation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BroadcastCiphertext {
     pub header: Vec<u8>,
-    pub ciphertext: Vec<u8>,
+    /// 8-byte base nonce.  Per-chunk nonce = base_nonce(8) || chunk_index(4 BE).
     pub nonce: Vec<u8>,
     pub policy: String,
-    /// Whether the plaintext was zstd-compressed before encryption.
-    /// Defaults to false for backward compatibility with old ciphertexts.
-    #[serde(default)]
+    /// Whether the plaintext was zstd-compressed before chunking.
     pub compressed: bool,
+    /// Per-chunk encrypted blobs.
+    pub chunks: Vec<Vec<u8>>,
+    /// Chunk size in bytes used during encryption.
+    pub chunk_size: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -154,9 +161,10 @@ pub fn generate_user_key(
 
 /// Encrypt plaintext under an access policy.
 ///
-/// The plaintext is zstd-compressed before encryption to reduce ciphertext
-/// size.  Returns a `BroadcastCiphertext` containing the CoverCrypt header
-/// and AES-256-GCM encrypted payload.
+/// Pipeline: zstd-compress (multi-threaded) → split into 1 MiB chunks →
+/// AES-256-GCM encrypt each chunk in parallel via rayon.
+///
+/// Each chunk uses a unique 12-byte nonce: `base_nonce(8) || chunk_index(4 BE)`.
 pub fn encrypt(
     mpk_bytes: &[u8],
     policy_str: &str,
@@ -164,14 +172,27 @@ pub fn encrypt(
 ) -> Result<BroadcastCiphertext> {
     use aes_gcm::{Aes256Gcm, Key, Nonce};
     use aes_gcm::aead::{Aead, KeyInit};
+    use rayon::prelude::*;
 
     let cc = Covercrypt::default();
     let mpk = de_mpk(mpk_bytes)?;
     let ap = AccessPolicy::parse(policy_str).map_err(map_cc_err)?;
 
-    // 0. Compress plaintext with zstd (level 3 = good balance)
-    let compressed = zstd::encode_all(plaintext, 3)
-        .map_err(|e| HimitsuError::Broadcast(format!("zstd compress failed: {e}")))?;
+    // 0. Compress plaintext with zstd (level 3, multi-threaded)
+    let compressed = {
+        use std::io::Write;
+        let mut encoder = zstd::Encoder::new(Vec::new(), 3)
+            .map_err(|e| HimitsuError::Broadcast(format!("zstd encoder init: {e}")))?;
+        encoder
+            .set_parameter(zstd::zstd_safe::CParameter::NbWorkers(num_cpus::get() as u32))
+            .map_err(|e| HimitsuError::Broadcast(format!("zstd set NbWorkers: {e}")))?;
+        encoder
+            .write_all(plaintext)
+            .map_err(|e| HimitsuError::Broadcast(format!("zstd write: {e}")))?;
+        encoder
+            .finish()
+            .map_err(|e| HimitsuError::Broadcast(format!("zstd finish: {e}")))?
+    };
 
     tracing::debug!(
         original = plaintext.len(),
@@ -180,43 +201,64 @@ pub fn encrypt(
         "zstd compression"
     );
 
-    // 1. Generate encrypted header encapsulating a shared secret
+    // 1. CoverCrypt header → shared secret
     let (secret, encrypted_header) =
         EncryptedHeader::generate(&cc, &mpk, &ap, None, None)
             .map_err(map_cc_err)?;
 
-    // 2. Use the 32-byte shared secret as AES-256-GCM key
+    // 2. Split compressed data into chunks and encrypt in parallel
+    let base_nonce: [u8; 8] = rand::random();
     let key = Key::<Aes256Gcm>::from_slice(&*secret);
-    let cipher = Aes256Gcm::new(key);
-    let nonce_bytes: [u8; 12] = rand::random();
-    let nonce = Nonce::from_slice(&nonce_bytes);
-    let ciphertext = cipher
-        .encrypt(nonce, compressed.as_ref())
-        .map_err(|e| HimitsuError::Broadcast(format!("AES-GCM encrypt failed: {e}")))?;
+
+    let chunk_results: Vec<std::result::Result<Vec<u8>, String>> = compressed
+        .par_chunks(CHUNK_SIZE)
+        .enumerate()
+        .map(|(idx, chunk)| {
+            let cipher = Aes256Gcm::new(key);
+            let mut nonce_buf = [0u8; 12];
+            nonce_buf[..8].copy_from_slice(&base_nonce);
+            nonce_buf[8..12].copy_from_slice(&(idx as u32).to_be_bytes());
+            let nonce = Nonce::from_slice(&nonce_buf);
+            cipher
+                .encrypt(nonce, chunk)
+                .map_err(|e| format!("AES-GCM encrypt chunk {idx}: {e}"))
+        })
+        .collect();
+
+    // Collect results, propagate first error
+    let encrypted_chunks: Vec<Vec<u8>> = chunk_results
+        .into_iter()
+        .collect::<std::result::Result<Vec<_>, String>>()
+        .map_err(|e| HimitsuError::Broadcast(e))?;
+
+    tracing::debug!(
+        num_chunks = encrypted_chunks.len(),
+        chunk_size = CHUNK_SIZE,
+        "Parallel AES-GCM encryption"
+    );
 
     Ok(BroadcastCiphertext {
         header: ser_header(&encrypted_header)?,
-        ciphertext,
-        nonce: nonce_bytes.to_vec(),
+        nonce: base_nonce.to_vec(),
         policy: policy_str.to_string(),
         compressed: true,
+        chunks: encrypted_chunks,
+        chunk_size: CHUNK_SIZE,
     })
 }
 
 /// Decrypt a `BroadcastCiphertext` using a user secret key.
 ///
-/// If the ciphertext was compressed (all new ciphertexts are), the plaintext
-/// is automatically zstd-decompressed.  Old uncompressed ciphertexts are
-/// handled transparently.
-///
-/// Returns the plaintext bytes, or an error if the user's access policy
-/// does not satisfy the encryption policy.
+/// Supports both chunked (new) and single-blob (legacy) formats.
+/// Chunks are decrypted in parallel via rayon, then reassembled and
+/// zstd-decompressed if the ciphertext was compressed.
 pub fn decrypt(
     usk_bytes: &[u8],
     broadcast_ct: &BroadcastCiphertext,
 ) -> Result<Vec<u8>> {
     use aes_gcm::{Aes256Gcm, Key, Nonce};
     use aes_gcm::aead::{Aead, KeyInit};
+    use rayon::prelude::*;
 
     let cc = Covercrypt::default();
     let usk = de_usk(usk_bytes)?;
@@ -232,13 +274,40 @@ pub fn decrypt(
             )
         })?;
 
-    // 2. Use the shared secret to decrypt the AES-GCM payload
     let key = Key::<Aes256Gcm>::from_slice(&*cleartext_header.secret);
-    let cipher = Aes256Gcm::new(key);
-    let nonce = Nonce::from_slice(&broadcast_ct.nonce);
-    let decrypted = cipher
-        .decrypt(nonce, broadcast_ct.ciphertext.as_ref())
-        .map_err(|e| HimitsuError::Decryption(format!("AES-GCM decrypt failed: {e}")))?;
+
+    // 2. Parallel chunked decryption
+    let base_nonce = &broadcast_ct.nonce;
+
+    let chunk_results: Vec<std::result::Result<Vec<u8>, String>> = broadcast_ct
+        .chunks
+        .par_iter()
+        .enumerate()
+        .map(|(idx, enc_chunk)| {
+            let cipher = Aes256Gcm::new(key);
+            let mut nonce_buf = [0u8; 12];
+            nonce_buf[..8].copy_from_slice(base_nonce);
+            nonce_buf[8..12].copy_from_slice(&(idx as u32).to_be_bytes());
+            let nonce = Nonce::from_slice(&nonce_buf);
+            cipher
+                .decrypt(nonce, enc_chunk.as_ref())
+                .map_err(|e| format!("AES-GCM decrypt chunk {idx}: {e}"))
+        })
+        .collect();
+
+    let plain_chunks: Vec<Vec<u8>> = chunk_results
+        .into_iter()
+        .collect::<std::result::Result<Vec<_>, String>>()
+        .map_err(|e| HimitsuError::Decryption(e))?;
+
+    tracing::debug!(num_chunks = plain_chunks.len(), "Parallel AES-GCM decryption");
+
+    // Reassemble in order
+    let total: usize = plain_chunks.iter().map(|c| c.len()).sum();
+    let mut decrypted = Vec::with_capacity(total);
+    for chunk in plain_chunks {
+        decrypted.extend_from_slice(&chunk);
+    }
 
     // 3. Decompress if needed
     if broadcast_ct.compressed {

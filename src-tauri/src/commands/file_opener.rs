@@ -45,6 +45,8 @@ pub enum InlineCategory {
     Audio,
     Text,
     Pdf,
+    /// Non-renderable binary; frontend shows file info + Save/Clear.
+    Binary,
 }
 
 /// MIME types that WebView / Chromium can render natively.
@@ -101,7 +103,8 @@ pub fn decide_render_action(data: &[u8], file_type: Option<&FileTypeInfo>) -> Re
     let mime = ft.mime.as_str();
 
     // Check if WebView can render it inline
-    if let Some(cat) = classify_inline(mime) {
+    let cat = classify_mime(mime);
+    if !matches!(cat, InlineCategory::Binary) {
         let b64 = base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
             data,
@@ -112,21 +115,6 @@ pub fn decide_render_action(data: &[u8], file_type: Option<&FileTypeInfo>) -> Re
             data_base64: b64.clone(),
             data_url: format!("data:{};base64,{}", ft.mime, b64),
             category: cat,
-        };
-    }
-
-    // PDF: WebView can render via <embed> or <iframe>
-    if mime == "application/pdf" {
-        let b64 = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            data,
-        );
-        return RenderAction::Inline {
-            mime: ft.mime.clone(),
-            extension: ft.extension.clone(),
-            data_base64: b64.clone(),
-            data_url: format!("data:application/pdf;base64,{}", b64),
-            category: InlineCategory::Pdf,
         };
     }
 
@@ -157,16 +145,20 @@ pub fn write_temp_and_open(data: &[u8], extension: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn classify_inline(mime: &str) -> Option<InlineCategory> {
+/// Classify a MIME type into an InlineCategory.
+/// Returns Binary for types that can't be rendered in WebView.
+pub fn classify_mime(mime: &str) -> InlineCategory {
     if INLINE_IMAGE.contains(&mime) {
-        Some(InlineCategory::Image)
+        InlineCategory::Image
     } else if INLINE_VIDEO.contains(&mime) {
-        Some(InlineCategory::Video)
+        InlineCategory::Video
     } else if INLINE_AUDIO.contains(&mime) {
-        Some(InlineCategory::Audio)
+        InlineCategory::Audio
     } else if INLINE_TEXT.contains(&mime) {
-        Some(InlineCategory::Text)
+        InlineCategory::Text
+    } else if mime == "application/pdf" {
+        InlineCategory::Pdf
     } else {
-        None
+        InlineCategory::Binary
     }
 }

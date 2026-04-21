@@ -149,10 +149,6 @@ pub fn generate_user_key(
 }
 
 /// Broadcast-encrypt plaintext under a policy expression.
-///
-/// Fingerprint embedding happens here: the plaintext is watermarked
-/// differently for each authorized user, and per-user ciphertexts
-/// are returned.
 #[tauri::command]
 pub fn encrypt_broadcast(
     plaintext_base64: String,
@@ -174,13 +170,13 @@ pub fn encrypt_broadcast(
         .map_err(|e| e.to_string())?
         .ok_or("Master key not initialized")?;
 
-    // 3. Encrypt (single ciphertext under the policy)
+    // 3. Encrypt
     let broadcast_ct = cover_crypt_ops::encrypt(&mpk_bytes, &policy, &plaintext)
         .map_err(|e| e.to_string())?;
 
-    // 4. Serialize and return as base64 JSON
-    let ct_json = serde_json::to_string(&broadcast_ct).map_err(|e| e.to_string())?;
-    Ok(base64::engine::general_purpose::STANDARD.encode(ct_json.as_bytes()))
+    // 4. Serialize with bincode and return as base64
+    let ct_bytes = bincode::serialize(&broadcast_ct).map_err(|e| e.to_string())?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(&ct_bytes))
 }
 
 /// Revoke a user's broadcast decryption key by rekeying the affected

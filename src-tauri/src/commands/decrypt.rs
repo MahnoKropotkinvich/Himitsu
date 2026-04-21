@@ -7,24 +7,21 @@ use crate::storage::models::DecryptResult;
 
 /// Decrypt a ciphertext.
 ///
-/// Automatically detects the file type of the plaintext and decides
-/// whether to return inline data (image/text/video/audio/PDF rendered
-/// directly in the WebView) or to write a temp file and open it with
-/// the system default application.
+/// Always returns the plaintext as an Inline render action with data_base64
+/// so the frontend can display or save it from the PLAINTEXT pane.
 #[tauri::command]
 pub fn decrypt_content(
     ciphertext_json_base64: String,
     user_secret_key_base64: String,
-    state: State<'_, AppState>,
 ) -> std::result::Result<DecryptResult, String> {
     use base64::Engine;
 
     // 1. Decode inputs
-    let ct_json = base64::engine::general_purpose::STANDARD
+    let ct_bytes = base64::engine::general_purpose::STANDARD
         .decode(&ciphertext_json_base64)
         .map_err(|e| format!("Invalid ciphertext base64: {e}"))?;
     let broadcast_ct: BroadcastCiphertext =
-        serde_json::from_slice(&ct_json).map_err(|e| format!("Invalid ciphertext JSON: {e}"))?;
+        bincode::deserialize(&ct_bytes).map_err(|e| format!("Invalid ciphertext: {e}"))?;
 
     let usk_bytes = base64::engine::general_purpose::STANDARD
         .decode(&user_secret_key_base64)
@@ -32,45 +29,47 @@ pub fn decrypt_content(
 
     // 2. CoverCrypt decrypt
     tracing::debug!(
-        ct_len = broadcast_ct.ciphertext.len(),
         usk_len = usk_bytes.len(),
         policy = %broadcast_ct.policy,
         "Attempting CoverCrypt decryption"
     );
+
     let plaintext =
         cover_crypt_ops::decrypt(&usk_bytes, &broadcast_ct).map_err(|e| {
             tracing::error!(error = %e, "Decryption failed");
             e.to_string()
         })?;
 
-    // 3. Detect file type
+    // 3. Detect file type and build Inline render for all types
     let ft = file_opener::detect_file_type(&plaintext);
+    let (mime, extension, category) = match &ft {
+        Some(f) => {
+            let cat = file_opener::classify_mime(&f.mime);
+            (f.mime.clone(), f.extension.clone(), cat)
+        }
+        None => {
+            if std::str::from_utf8(&plaintext).is_ok() {
+                ("text/plain".into(), "txt".into(), file_opener::InlineCategory::Text)
+            } else {
+                ("application/octet-stream".into(), "bin".into(), file_opener::InlineCategory::Binary)
+            }
+        }
+    };
+
     tracing::info!(
         plaintext_len = plaintext.len(),
-        mime = ft.as_ref().map(|f| f.mime.as_str()).unwrap_or("unknown"),
+        mime = %mime,
         "Decryption successful"
     );
 
-    // 4. Decide render action
-    let mut render = file_opener::decide_render_action(&plaintext, ft.as_ref());
-
-    // 5. If External, write temp file and open it
-    if let file_opener::RenderAction::External {
-        ref extension,
-        ref mut temp_path,
-        ..
-    } = render
-    {
-        let path = file_opener::write_temp_and_open(&plaintext, extension)
-            .map_err(|e| e.to_string())?;
-        *temp_path = path.display().to_string();
-        // Register for cleanup on exit
-        state
-            .temp_files
-            .lock()
-            .unwrap()
-            .push(path);
-    }
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&plaintext);
+    let render = file_opener::RenderAction::Inline {
+        data_base64: b64.clone(),
+        data_url: format!("data:{};base64,{}", mime, b64),
+        mime: mime.clone(),
+        extension,
+        category,
+    };
 
     Ok(DecryptResult {
         success: true,
@@ -80,8 +79,7 @@ pub fn decrypt_content(
     })
 }
 
-/// Decrypt and explicitly open with the system default application,
-/// bypassing inline rendering even for types the WebView supports.
+/// Decrypt and explicitly open with the system default application.
 #[tauri::command]
 pub fn decrypt_and_open(
     ciphertext_json_base64: String,
@@ -91,11 +89,11 @@ pub fn decrypt_and_open(
     use base64::Engine;
 
     // 1. Decode
-    let ct_json = base64::engine::general_purpose::STANDARD
+    let ct_bytes = base64::engine::general_purpose::STANDARD
         .decode(&ciphertext_json_base64)
         .map_err(|e| format!("Invalid ciphertext base64: {e}"))?;
     let broadcast_ct: BroadcastCiphertext =
-        serde_json::from_slice(&ct_json).map_err(|e| format!("Invalid ciphertext JSON: {e}"))?;
+        bincode::deserialize(&ct_bytes).map_err(|e| format!("Invalid ciphertext: {e}"))?;
 
     let usk_bytes = base64::engine::general_purpose::STANDARD
         .decode(&user_secret_key_base64)
@@ -218,7 +216,6 @@ pub fn set_active_receiver_key(
 ) -> std::result::Result<(), String> {
     use crate::storage::schema::CF_RECEIVER;
     let db = state.db.lock().unwrap();
-    // Verify the key exists
     db.get_cf(CF_RECEIVER, key_id.as_bytes())
         .map_err(|e| e.to_string())?
         .ok_or("Key not found")?;
