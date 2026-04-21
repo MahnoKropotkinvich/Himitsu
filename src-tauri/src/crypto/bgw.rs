@@ -26,7 +26,7 @@ const PAIRING_PARAMS: &str = "type a\nq 8780710799663312522437781984754049815806
 pub struct BroadcastCiphertext {
     /// Serialized BGW header elements.
     pub header: Vec<Vec<u8>>,
-    /// Indices of authorized users.
+    /// Indices of authorized users (required by BGW decryption math).
     pub recipients: Vec<u32>,
     /// Base nonce (8 bytes) for chunked AES-GCM.
     pub nonce: Vec<u8>,
@@ -72,7 +72,7 @@ impl BgwSystem {
             let n = (*gps).N;
             let a = (*gps).A;
             let b = (*gps).B;
-            tracing::info!(N = n, A = a, B = b, "BGW system generated (new keys)");
+            tracing::info!(N = n, A = a, B = b, "BGW system generated");
 
             Ok(BgwSystem { gps, sys })
         }
@@ -97,10 +97,8 @@ impl BgwSystem {
             out.extend_from_slice(&b.to_le_bytes());
             out.extend_from_slice(&n.to_le_bytes());
 
-            // Serialize generator g
             serialize_element(&mut out, pk.g.as_ptr() as *mut _);
 
-            // Serialize g_i (2*B elements)
             let num_gi = (2 * b) as usize;
             out.extend_from_slice(&(num_gi as u32).to_le_bytes());
             for i in 0..num_gi {
@@ -108,14 +106,12 @@ impl BgwSystem {
                 serialize_element(&mut out, elem);
             }
 
-            // Serialize v_i (A elements)
             out.extend_from_slice(&a.to_le_bytes());
             for i in 0..a as usize {
                 let elem = pk.v_i.offset(i as isize) as *mut pbc_bkem_sys::element_s;
                 serialize_element(&mut out, elem);
             }
 
-            // Serialize d_i (N private keys)
             out.extend_from_slice(&n.to_le_bytes());
             for i in 0..n as usize {
                 let elem = (*self.sys).d_i.offset(i as isize) as *mut pbc_bkem_sys::element_s;
@@ -132,7 +128,6 @@ impl BgwSystem {
             .map_err(|e| HimitsuError::Broadcast(format!("Params: {e}")))?;
 
         unsafe {
-            // Initialize pairing context
             let mut gps: pbc_bkem_sys::bkem_global_params_t = std::ptr::null_mut();
             pbc_bkem_sys::setup_global_system(&mut gps, params_cstr.as_ptr(), MAX_USERS as i32);
             if gps.is_null() {
@@ -145,20 +140,17 @@ impl BgwSystem {
             let b = read_u32(data, &mut cursor);
             let n = read_u32(data, &mut cursor);
 
-            // Allocate system structs
             let sys = libc::malloc(std::mem::size_of::<pbc_bkem_sys::bkem_system_s>())
                 as pbc_bkem_sys::bkem_system_t;
             let pk = libc::malloc(std::mem::size_of::<pbc_bkem_sys::pubkey_s>())
                 as pbc_bkem_sys::pubkey_t;
             (*sys).PK = pk;
 
-            // Deserialize g
             pbc_bkem_sys::himitsu_element_init_G1(
                 (*pk).g.as_mut_ptr(), (*gps).pairing.as_mut_ptr()
             );
             deserialize_element((*pk).g.as_mut_ptr(), data, &mut cursor);
 
-            // Deserialize g_i
             let num_gi = read_u32(data, &mut cursor) as usize;
             (*pk).g_i = libc::malloc(num_gi * std::mem::size_of::<pbc_bkem_sys::element_t>())
                 as *mut pbc_bkem_sys::element_t;
@@ -168,7 +160,6 @@ impl BgwSystem {
                 deserialize_element(elem, data, &mut cursor);
             }
 
-            // Deserialize v_i
             let num_vi = read_u32(data, &mut cursor) as usize;
             (*pk).v_i = libc::malloc(num_vi * std::mem::size_of::<pbc_bkem_sys::element_t>())
                 as *mut pbc_bkem_sys::element_t;
@@ -178,7 +169,6 @@ impl BgwSystem {
                 deserialize_element(elem, data, &mut cursor);
             }
 
-            // Deserialize d_i (private keys)
             let num_di = read_u32(data, &mut cursor) as usize;
             (*sys).d_i = libc::malloc(num_di * std::mem::size_of::<pbc_bkem_sys::element_t>())
                 as *mut pbc_bkem_sys::element_t;
@@ -236,14 +226,12 @@ impl BgwSystem {
                 return Err(HimitsuError::Broadcast("get_encryption_key failed".into()));
             }
 
-            // Serialize K (GT element) and derive AES key via SHA-256
             let k_ptr = (*keypair).K.as_mut_ptr();
             let k_len = pbc_bkem_sys::himitsu_element_length_in_bytes(k_ptr) as usize;
             let mut k_buf = vec![0u8; k_len];
             pbc_bkem_sys::himitsu_element_to_bytes(k_buf.as_mut_ptr(), k_ptr);
             let aes_key: [u8; 32] = Sha256::digest(&k_buf).into();
 
-            // Serialize header elements: HDR has A+1 elements
             let a = (*self.gps).A as usize;
             let num_hdr = a + 1;
             let mut header = Vec::with_capacity(num_hdr);
@@ -255,7 +243,6 @@ impl BgwSystem {
                 header.push(ebuf);
             }
 
-            // Clean up
             for i in 0..num_hdr {
                 pbc_bkem_sys::himitsu_element_clear(
                     (*keypair).HDR.offset(i as isize) as *mut pbc_bkem_sys::element_s
@@ -331,7 +318,6 @@ impl BgwSystem {
                 (*self.sys).PK,
             );
 
-            // Serialize K and derive AES key
             let k_ptr = k.as_mut_ptr();
             let k_len = pbc_bkem_sys::himitsu_element_length_in_bytes(k_ptr) as usize;
             let mut k_buf = vec![0u8; k_len];
@@ -374,7 +360,6 @@ pub fn encrypt(
     use aes_gcm::aead::{Aead, KeyInit};
     use rayon::prelude::*;
 
-    // 0. Compress
     let compressed = {
         use std::io::Write;
         let mut enc = zstd::Encoder::new(Vec::new(), 3)
@@ -384,10 +369,8 @@ pub fn encrypt(
         enc.finish().map_err(|e| HimitsuError::Broadcast(format!("zstd: {e}")))?
     };
 
-    // 1. BGW key encapsulation
     let (header, aes_key) = bgw.encapsulate(recipients)?;
 
-    // 2. Chunked parallel AES-GCM
     let base_nonce: [u8; 8] = rand::random();
     let key = Key::<Aes256Gcm>::from_slice(&aes_key);
 
@@ -430,10 +413,8 @@ pub fn decrypt(
     use aes_gcm::aead::{Aead, KeyInit};
     use rayon::prelude::*;
 
-    // 1. BGW decapsulation
     let aes_key = bgw.decapsulate(user_index, d_i_bytes, &ct.recipients, &ct.header)?;
 
-    // 2. Chunked parallel AES-GCM decrypt
     let key = Key::<Aes256Gcm>::from_slice(&aes_key);
     let base_nonce = &ct.nonce;
 
@@ -460,7 +441,6 @@ pub fn decrypt(
         decrypted.extend_from_slice(&chunk);
     }
 
-    // 3. Decompress
     if ct.compressed {
         zstd::decode_all(decrypted.as_slice())
             .map_err(|e| HimitsuError::Decryption(format!("zstd: {e}")))

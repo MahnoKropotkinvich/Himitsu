@@ -1,52 +1,16 @@
+//! File type detection and classification utilities.
+//!
+//! Provides MIME detection via magic bytes, inline-rendering classification
+//! for the WebView frontend, and temporary file management.
+
 use crate::error::Result;
+use crate::storage::models::{InlineCategory, RenderAction};
 use std::path::PathBuf;
 
-/// Detected file type info.
+/// Detected file type info from magic bytes.
 pub struct FileTypeInfo {
     pub mime: String,
     pub extension: String,
-}
-
-/// How the frontend should handle the decrypted content.
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(tag = "kind")]
-pub enum RenderAction {
-    /// Content can be rendered inline by the WebView.
-    /// `data_url` is a complete `data:` URI ready for src= attributes
-    /// or direct display.
-    Inline {
-        mime: String,
-        extension: String,
-        /// base64-encoded data for embedding
-        data_base64: String,
-        /// Pre-built data URI: `data:<mime>;base64,<data>`
-        data_url: String,
-        category: InlineCategory,
-    },
-    /// Content must be opened with an external system application.
-    External {
-        mime: String,
-        extension: String,
-        /// Path to the temp file written to disk.
-        temp_path: String,
-    },
-    /// File type unknown; provide raw hex preview + option to save.
-    Unknown {
-        size_bytes: usize,
-        hex_preview: String,
-    },
-}
-
-/// What kind of inline rendering the frontend should use.
-#[derive(Debug, Clone, serde::Serialize)]
-pub enum InlineCategory {
-    Image,
-    Video,
-    Audio,
-    Text,
-    Pdf,
-    /// Non-renderable binary; frontend shows file info + Save/Clear.
-    Binary,
 }
 
 /// MIME types that WebView / Chromium can render natively.
@@ -67,7 +31,7 @@ const INLINE_TEXT: &[&str] = &[
     "application/xml",
 ];
 
-/// Detect the file type of decrypted content using magic bytes.
+/// Detect the file type of binary content using magic bytes.
 pub fn detect_file_type(data: &[u8]) -> Option<FileTypeInfo> {
     infer::get(data).map(|t| FileTypeInfo {
         mime: t.mime_type().to_string(),
@@ -75,10 +39,9 @@ pub fn detect_file_type(data: &[u8]) -> Option<FileTypeInfo> {
     })
 }
 
-/// Decide how to present the decrypted content to the user.
+/// Decide how to present decrypted content to the user.
 pub fn decide_render_action(data: &[u8], file_type: Option<&FileTypeInfo>) -> RenderAction {
     let Some(ft) = file_type else {
-        // Try to detect if it's valid UTF-8 text
         if std::str::from_utf8(data).is_ok() {
             let b64 = base64::Engine::encode(
                 &base64::engine::general_purpose::STANDARD,
@@ -92,7 +55,6 @@ pub fn decide_render_action(data: &[u8], file_type: Option<&FileTypeInfo>) -> Re
                 category: InlineCategory::Text,
             };
         }
-        // Truly unknown binary
         let preview_len = data.len().min(256);
         return RenderAction::Unknown {
             size_bytes: data.len(),
@@ -101,8 +63,6 @@ pub fn decide_render_action(data: &[u8], file_type: Option<&FileTypeInfo>) -> Re
     };
 
     let mime = ft.mime.as_str();
-
-    // Check if WebView can render it inline
     let cat = classify_mime(mime);
     if !matches!(cat, InlineCategory::Binary) {
         let b64 = base64::Engine::encode(
@@ -118,19 +78,16 @@ pub fn decide_render_action(data: &[u8], file_type: Option<&FileTypeInfo>) -> Re
         };
     }
 
-    // Fall back to external application
     RenderAction::External {
         mime: ft.mime.clone(),
         extension: ft.extension.clone(),
-        temp_path: String::new(), // filled by caller after writing temp file
+        temp_path: String::new(),
     }
 }
 
-/// Write decrypted bytes to a temporary file with the correct extension
-/// and open it using the system's default application.
+/// Write decrypted bytes to a temporary file and open with system default app.
 ///
-/// Returns the path to the temp file (caller must register it for
-/// cleanup when the application exits).
+/// Returns the path to the temp file (caller must register for cleanup).
 pub fn write_temp_and_open(data: &[u8], extension: &str) -> Result<PathBuf> {
     let dir = std::env::temp_dir().join("himitsu");
     std::fs::create_dir_all(&dir)?;
@@ -145,8 +102,7 @@ pub fn write_temp_and_open(data: &[u8], extension: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// Classify a MIME type into an InlineCategory.
-/// Returns Binary for types that can't be rendered in WebView.
+/// Classify a MIME type into a rendering category for the frontend.
 pub fn classify_mime(mime: &str) -> InlineCategory {
     if INLINE_IMAGE.contains(&mime) {
         InlineCategory::Image
