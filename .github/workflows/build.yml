@@ -83,23 +83,33 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           brew install gmp
+          echo "LIBRARY_PATH=$(brew --prefix)/lib" >> $GITHUB_ENV
+          echo "CPATH=$(brew --prefix)/include" >> $GITHUB_ENV
 
-      # ── Windows system deps (vcpkg + cache) ─────────────────
+      # ── Windows system deps (vcpkg + explicit cache save) ────
       - name: Set VCPKG_ROOT (Windows)
         if: runner.os == 'Windows'
         shell: bash
         run: echo "VCPKG_ROOT=$VCPKG_INSTALLATION_ROOT" >> $GITHUB_ENV
 
-      - name: Cache vcpkg installed packages (Windows)
+      - name: Restore vcpkg cache (Windows)
         if: runner.os == 'Windows'
-        uses: actions/cache@v4
+        id: vcpkg-cache
+        uses: actions/cache/restore@v4
         with:
           path: ${{ env.VCPKG_INSTALLATION_ROOT }}/installed
-          key: vcpkg-x64-windows-gmp
+          key: vcpkg-x64-windows-gmp-v1
 
       - name: Install GMP via vcpkg (Windows)
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && steps.vcpkg-cache.outputs.cache-hit != 'true'
         run: vcpkg install gmp:x64-windows-static-md
+
+      - name: Save vcpkg cache (Windows)
+        if: runner.os == 'Windows' && steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.VCPKG_INSTALLATION_ROOT }}/installed
+          key: vcpkg-x64-windows-gmp-v1
 
       - name: Set vcpkg env (Windows)
         if: runner.os == 'Windows'

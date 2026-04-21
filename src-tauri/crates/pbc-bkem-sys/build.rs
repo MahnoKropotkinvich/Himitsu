@@ -2,9 +2,8 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
-    let bkem_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap())
-        .join("../..")
-        .join("vendor/PBC_BKEM");
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let bkem_dir = manifest_dir.join("../../vendor/PBC_BKEM");
 
     let bkem_c = bkem_dir.join("bkem.c");
     if !bkem_c.exists() {
@@ -23,11 +22,11 @@ fn main() {
         build_vendored_pbc();
     }
 
-    // --- Build bkem.c + bkem_helpers.c ---
+    // --- Build bkem.c (from submodule) + bkem_helpers.c (local to this crate) ---
     let mut bkem_build = cc::Build::new();
     bkem_build
         .file(&bkem_c)
-        .file(bkem_dir.join("bkem_helpers.c"))
+        .file(manifest_dir.join("bkem_helpers.c"))
         .include(&bkem_dir)
         // Always include GMP system paths (GMP is a hard system dependency)
         .include("/opt/homebrew/include")
@@ -77,8 +76,9 @@ fn main() {
     bkem_build.compile("bkem");
 
     // --- Generate Rust bindings ---
+    // bkem_wrapper.h is local to this crate; it includes bkem.h from the submodule
     let mut bindgen_builder = bindgen::Builder::default()
-        .header(bkem_dir.join("bkem_wrapper.h").to_str().unwrap())
+        .header(manifest_dir.join("bkem_wrapper.h").to_str().unwrap())
         .clang_arg(format!("-I{}", bkem_dir.display()))
         // GMP system headers (always needed)
         .clang_arg("-I/opt/homebrew/include")
@@ -122,8 +122,8 @@ fn main() {
 
     println!("cargo:rerun-if-changed={}", bkem_c.display());
     println!("cargo:rerun-if-changed={}", bkem_dir.join("bkem.h").display());
-    println!("cargo:rerun-if-changed={}", bkem_dir.join("bkem_wrapper.h").display());
-    println!("cargo:rerun-if-changed={}", bkem_dir.join("bkem_helpers.c").display());
+    println!("cargo:rerun-if-changed={}", manifest_dir.join("bkem_wrapper.h").display());
+    println!("cargo:rerun-if-changed={}", manifest_dir.join("bkem_helpers.c").display());
 }
 
 /// Try to find system-installed libpbc via pkg-config or common paths.

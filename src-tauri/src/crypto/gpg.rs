@@ -1,3 +1,5 @@
+//! GPG key operations: parsing, encryption, decryption, and key wrapping.
+
 use crate::error::{HimitsuError, Result};
 
 /// Import and parse an ASCII-armored GPG public key.
@@ -42,9 +44,8 @@ pub fn fingerprint_hex(key: &pgp::composed::SignedPublicKey) -> String {
 
 /// Encrypt arbitrary binary data to a GPG public key.
 ///
-/// GPG keys typically have a signing primary key (EdDSA/RSA) and a separate
-/// encryption subkey (ECDH/X25519/RSA).  This function selects the first
-/// encryption-capable subkey; if none exists it falls back to the primary key.
+/// Selects the first encryption-capable subkey (ECDH/X25519); falls back
+/// to the primary key if none exists.
 pub fn encrypt_to_key(
     data: &[u8],
     public_key: &pgp::composed::SignedPublicKey,
@@ -55,22 +56,18 @@ pub fn encrypt_to_key(
 
     let msg = Message::new_literal_bytes("encrypted.bin", data);
 
-    // Find an encryption-capable subkey (ECDH, X25519, RSA-encrypt, etc.)
-    // The primary key on Ed25519 keys is EdDSALegacy which is sign-only.
     let enc_subkey = public_key
         .public_subkeys
         .iter()
         .find(|sk| sk.key.is_encryption_key());
 
     let encrypted = if let Some(subkey) = enc_subkey {
-        // Use the inner packet::PublicSubkey directly
         msg.encrypt_to_keys_seipdv1(
             &mut rand::thread_rng(),
             SymmetricKeyAlgorithm::AES256,
             &[&subkey.key],
         )
     } else {
-        // Fallback: primary key (works for RSA-only keys)
         msg.encrypt_to_keys_seipdv1(
             &mut rand::thread_rng(),
             SymmetricKeyAlgorithm::AES256,
@@ -87,8 +84,6 @@ pub fn encrypt_to_key(
 }
 
 /// Decrypt a GPG-encrypted message using a secret key and passphrase.
-///
-/// Accepts ASCII-armored PGP message bytes and returns the raw plaintext.
 pub fn decrypt_with_secret_key(
     encrypted_armored: &[u8],
     secret_key: &pgp::composed::SignedSecretKey,
@@ -104,7 +99,6 @@ pub fn decrypt_with_secret_key(
         .decrypt(|| passphrase.to_string(), &[secret_key])
         .map_err(|e| HimitsuError::Gpg(format!("Decryption failed: {e}")))?;
 
-    // get_content() handles decompression automatically
     let body = decrypted_msg
         .get_content()
         .map_err(|e| HimitsuError::Gpg(format!("Failed to extract content: {e}")))?

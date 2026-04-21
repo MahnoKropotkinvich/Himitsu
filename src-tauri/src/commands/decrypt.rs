@@ -1,13 +1,15 @@
+//! Decryption commands: file, folder, and inline content decryption.
+
 use tauri::State;
 
 use crate::AppState;
-use crate::crypto::broadcast::{self, BroadcastCiphertext};
-use super::file_opener;
-use crate::storage::models::DecryptResult;
+use crate::crypto::bgw::{self, BroadcastCiphertext};
+use crate::storage::models::{DecryptResult, DecryptFileResult};
+use crate::util::file_type;
 
 /// Decrypt a ciphertext (base64-encoded bincode).
 ///
-/// Uses the active receiver key's BGW index for decryption.
+/// Uses the active receiver key's BGW private key for decryption.
 #[tauri::command]
 pub fn decrypt_content(
     ciphertext_base64: String,
@@ -15,33 +17,29 @@ pub fn decrypt_content(
 ) -> std::result::Result<DecryptResult, String> {
     use base64::Engine;
 
-    // 1. Load active receiver key
     let db = state.db.lock().unwrap();
-    let rk = load_active_rk(&db)?;
+    let rk = super::keys::load_active_rk(&db)?;
     drop(db);
 
-    // 2. Decode ciphertext
     let ct_bytes = base64::engine::general_purpose::STANDARD
         .decode(&ciphertext_base64)
         .map_err(|e| format!("Invalid ciphertext base64: {e}"))?;
     let broadcast_ct: BroadcastCiphertext =
         bincode::deserialize(&ct_bytes).map_err(|e| format!("Invalid ciphertext: {e}"))?;
 
-    // 3. Decrypt
     let bgw_guard = state.bgw.lock().unwrap();
-    let bgw = bgw_guard.as_ref().ok_or("BGW system not initialized")?;
+    let bgw_sys = bgw_guard.as_ref().ok_or("BGW system not initialized")?;
 
-    let plaintext = broadcast::decrypt(bgw, rk.bgw_index, &rk.usk_bytes, &broadcast_ct)
+    let plaintext = bgw::decrypt(bgw_sys, rk.bgw_index, &rk.usk_bytes, &broadcast_ct)
         .map_err(|e| {
             tracing::error!(error = %e, "Decryption failed");
             e.to_string()
         })?;
 
-    // 4. Detect file type and build Inline render
-    let ft = file_opener::detect_file_type(&plaintext);
+    let ft = file_type::detect_file_type(&plaintext);
     let (mime, extension, _category) = match &ft {
         Some(f) => {
-            let cat = file_opener::classify_mime(&f.mime);
+            let cat = file_type::classify_mime(&f.mime);
             (f.mime.clone(), f.extension.clone(), format!("{:?}", cat))
         }
         None => {
@@ -54,12 +52,12 @@ pub fn decrypt_content(
     };
 
     let b64 = base64::engine::general_purpose::STANDARD.encode(&plaintext);
-    let render = file_opener::RenderAction::Inline {
+    let render = crate::storage::models::RenderAction::Inline {
         data_base64: b64.clone(),
         data_url: format!("data:{};base64,{}", mime, b64),
         mime: mime.clone(),
         extension,
-        category: file_opener::classify_mime(&mime),
+        category: file_type::classify_mime(&mime),
     };
 
     Ok(DecryptResult {
@@ -79,7 +77,7 @@ pub fn decrypt_and_open(
     use base64::Engine;
 
     let db = state.db.lock().unwrap();
-    let rk = load_active_rk(&db)?;
+    let rk = super::keys::load_active_rk(&db)?;
     drop(db);
 
     let ct_bytes = base64::engine::general_purpose::STANDARD
@@ -89,19 +87,19 @@ pub fn decrypt_and_open(
         bincode::deserialize(&ct_bytes).map_err(|e| format!("Invalid ciphertext: {e}"))?;
 
     let bgw_guard = state.bgw.lock().unwrap();
-    let bgw = bgw_guard.as_ref().ok_or("BGW system not initialized")?;
+    let bgw_sys = bgw_guard.as_ref().ok_or("BGW system not initialized")?;
 
-    let plaintext = broadcast::decrypt(bgw, rk.bgw_index, &rk.usk_bytes, &broadcast_ct)
+    let plaintext = bgw::decrypt(bgw_sys, rk.bgw_index, &rk.usk_bytes, &broadcast_ct)
         .map_err(|e| e.to_string())?;
 
-    let ft = file_opener::detect_file_type(&plaintext);
+    let ft = file_type::detect_file_type(&plaintext);
     let ext = ft.as_ref().map(|f| f.extension.as_str()).unwrap_or("bin");
     let mime = ft.as_ref().map(|f| f.mime.clone()).unwrap_or_else(|| "application/octet-stream".into());
 
-    let path = file_opener::write_temp_and_open(&plaintext, ext).map_err(|e| e.to_string())?;
+    let path = file_type::write_temp_and_open(&plaintext, ext).map_err(|e| e.to_string())?;
     state.temp_files.lock().unwrap().push(path.clone());
 
-    let render = file_opener::RenderAction::External {
+    let render = crate::storage::models::RenderAction::External {
         mime,
         extension: ext.to_string(),
         temp_path: path.display().to_string(),
@@ -115,155 +113,168 @@ pub fn decrypt_and_open(
     })
 }
 
-/// Import a GPG-encrypted receiver key (contains BGW private key + index).
+/// Decrypt a file on disk.
+///
+/// For files < 10 MiB, also returns base64 data for inline preview.
 #[tauri::command]
-pub fn import_receiver_key(
-    encrypted_bytes: Vec<u8>,
-    armored_secret_key: String,
-    passphrase: String,
-    label: String,
+pub fn decrypt_file(
+    input_path: String,
     state: State<'_, AppState>,
-) -> std::result::Result<String, String> {
-    use crate::crypto::gpg_ops;
-    use crate::storage::models::{ReceiverKey, UserKeyRecord};
-    use crate::storage::schema::CF_RECEIVER;
+) -> std::result::Result<DecryptFileResult, String> {
+    use base64::Engine;
 
-    let sk = gpg_ops::parse_secret_key(&armored_secret_key).map_err(|e| e.to_string())?;
-    let decrypted = gpg_ops::decrypt_with_secret_key(&encrypted_bytes, &sk, &passphrase)
+    let db = state.db.lock().unwrap();
+    let rk = super::keys::load_active_rk(&db)?;
+    drop(db);
+
+    let ct_bytes = std::fs::read(&input_path)
+        .map_err(|e| format!("Failed to read ciphertext file: {e}"))?;
+    let broadcast_ct: BroadcastCiphertext =
+        bincode::deserialize(&ct_bytes)
+            .map_err(|e| format!("Invalid ciphertext file: {e}"))?;
+
+    let bgw_guard = state.bgw.lock().unwrap();
+    let bgw_sys = bgw_guard.as_ref().ok_or("BGW system not initialized")?;
+
+    let plaintext = bgw::decrypt(bgw_sys, rk.bgw_index, &rk.usk_bytes, &broadcast_ct)
         .map_err(|e| {
-            tracing::error!(error = %e, "Failed to decrypt receiver key");
+            tracing::error!(error = %e, "File decryption failed");
             e.to_string()
         })?;
 
-    // Deserialize the key bundle to extract bgw_index + key_data
-    let bundle: UserKeyRecord = bincode::deserialize(&decrypted)
-        .map_err(|e| format!("Invalid key format: {e}"))?;
+    // Check if decrypted content is a tar archive (encrypted folder)
+    let is_tar = plaintext.len() > 262 && &plaintext[257..262] == b"ustar";
 
-    tracing::info!(bgw_index = bundle.bgw_index, "Receiver key imported");
+    if is_tar {
+        let dir = std::env::temp_dir().join("himitsu");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let out_dir = dir.join(format!("dir_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
 
-    let id = uuid::Uuid::new_v4().to_string();
-    let rk = ReceiverKey {
-        id: id.clone(),
-        label,
-        created_at: chrono::Utc::now(),
-        bgw_index: bundle.bgw_index,
-        usk_bytes: bundle.key_data,
+        let cursor = std::io::Cursor::new(&plaintext);
+        let mut archive = tar::Archive::new(cursor);
+        archive.unpack(&out_dir)
+            .map_err(|e| format!("Failed to untar: {e}"))?;
+
+        tracing::info!(
+            input_path = %input_path,
+            output_dir = %out_dir.display(),
+            tar_size = plaintext.len(),
+            "Decrypted folder extracted"
+        );
+
+        return Ok(DecryptFileResult {
+            size: plaintext.len(),
+            mime: "inode/directory".into(),
+            extension: String::new(),
+            temp_path: out_dir.display().to_string(),
+            category: "Folder".into(),
+            preview_base64: None,
+            preview_data_url: None,
+        });
+    }
+
+    // Detect file type (regular file)
+    let ft = file_type::detect_file_type(&plaintext);
+    let (mime, extension, category) = match &ft {
+        Some(f) => {
+            let cat = file_type::classify_mime(&f.mime);
+            (f.mime.clone(), f.extension.clone(), format!("{:?}", cat))
+        }
+        None => {
+            if std::str::from_utf8(&plaintext).is_ok() {
+                ("text/plain".into(), "txt".into(), "Text".into())
+            } else {
+                ("application/octet-stream".into(), "bin".into(), "Binary".into())
+            }
+        }
     };
 
-    let db = state.db.lock().unwrap();
-    let data = bincode::serialize(&rk).map_err(|e| e.to_string())?;
-    db.put_cf(CF_RECEIVER, id.as_bytes(), &data).map_err(|e| e.to_string())?;
-    db.put_cf(CF_RECEIVER, b"__active__", id.as_bytes()).map_err(|e| e.to_string())?;
+    let dir = std::env::temp_dir().join("himitsu");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let filename = format!("dec_{}.{}", uuid::Uuid::new_v4(), extension);
+    let temp_path = dir.join(&filename);
+    std::fs::write(&temp_path, &plaintext)
+        .map_err(|e| format!("Failed to write temp file: {e}"))?;
 
-    Ok(id)
-}
+    state.temp_files.lock().unwrap().push(temp_path.clone());
 
-/// List all saved receiver keys.
-#[tauri::command]
-pub fn list_receiver_keys(
-    state: State<'_, AppState>,
-) -> std::result::Result<Vec<ReceiverKeyInfo>, String> {
-    use crate::storage::models::ReceiverKey;
-    use crate::storage::schema::CF_RECEIVER;
+    /// Size threshold for inline preview (10 MiB).
+    const INLINE_PREVIEW_MAX: usize = 10 << 20;
 
-    let db = state.db.lock().unwrap();
-    let active_id = db.get_cf(CF_RECEIVER, b"__active__")
-        .map_err(|e| e.to_string())?
-        .map(|b| String::from_utf8_lossy(&b).to_string())
-        .unwrap_or_default();
-
-    let entries = db.iter_cf(CF_RECEIVER).map_err(|e| e.to_string())?;
-    let mut keys = Vec::new();
-    for (k, v) in entries {
-        let key_str = String::from_utf8_lossy(&k);
-        if key_str == "__active__" { continue; }
-        if let Ok(rk) = bincode::deserialize::<ReceiverKey>(&v) {
-            keys.push(ReceiverKeyInfo {
-                id: rk.id.clone(),
-                label: rk.label,
-                created_at: rk.created_at.to_rfc3339(),
-                active: rk.id == active_id,
-                bgw_index: rk.bgw_index,
-            });
-        }
-    }
-    Ok(keys)
-}
-
-/// Set active receiver key.
-#[tauri::command]
-pub fn set_active_receiver_key(
-    key_id: String,
-    state: State<'_, AppState>,
-) -> std::result::Result<(), String> {
-    use crate::storage::schema::CF_RECEIVER;
-    let db = state.db.lock().unwrap();
-    db.get_cf(CF_RECEIVER, key_id.as_bytes())
-        .map_err(|e| e.to_string())?.ok_or("Key not found")?;
-    db.put_cf(CF_RECEIVER, b"__active__", key_id.as_bytes()).map_err(|e| e.to_string())
-}
-
-/// Delete a receiver key.
-#[tauri::command]
-pub fn delete_receiver_key(
-    key_id: String,
-    state: State<'_, AppState>,
-) -> std::result::Result<(), String> {
-    use crate::storage::schema::CF_RECEIVER;
-    let db = state.db.lock().unwrap();
-    let active_id = db.get_cf(CF_RECEIVER, b"__active__")
-        .map_err(|e| e.to_string())?
-        .map(|b| String::from_utf8_lossy(&b).to_string())
-        .unwrap_or_default();
-    db.delete_cf(CF_RECEIVER, key_id.as_bytes()).map_err(|e| e.to_string())?;
-    if active_id == key_id {
-        db.delete_cf(CF_RECEIVER, b"__active__").map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
-
-/// Load active receiver key's BGW index (for frontend status).
-#[tauri::command]
-pub fn load_active_receiver_key(
-    state: State<'_, AppState>,
-) -> std::result::Result<String, String> {
-    use crate::storage::models::ReceiverKey;
-    use crate::storage::schema::CF_RECEIVER;
-
-    let db = state.db.lock().unwrap();
-    let active_id = match db.get_cf(CF_RECEIVER, b"__active__").map_err(|e| e.to_string())? {
-        Some(b) => String::from_utf8_lossy(&b).to_string(),
-        None => return Ok(String::new()),
+    let (preview_base64, preview_data_url) = if plaintext.len() <= INLINE_PREVIEW_MAX {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&plaintext);
+        let data_url = format!("data:{};base64,{}", mime, b64);
+        (Some(b64), Some(data_url))
+    } else {
+        (None, None)
     };
-    match db.get_cf(CF_RECEIVER, active_id.as_bytes()).map_err(|e| e.to_string())? {
-        Some(data) => {
-            let rk: ReceiverKey = bincode::deserialize(&data).map_err(|e| e.to_string())?;
-            // Return the BGW index as a string (frontend uses this to check if key is loaded)
-            Ok(rk.bgw_index.to_string())
-        }
-        None => Ok(String::new()),
-    }
+
+    tracing::info!(
+        input_path = %input_path,
+        plaintext_size = plaintext.len(),
+        mime = %mime,
+        "File decrypted"
+    );
+
+    Ok(DecryptFileResult {
+        size: plaintext.len(),
+        mime, extension,
+        temp_path: temp_path.display().to_string(),
+        category,
+        preview_base64, preview_data_url,
+    })
 }
 
-#[derive(serde::Serialize)]
-pub struct ReceiverKeyInfo {
-    pub id: String,
-    pub label: String,
-    pub created_at: String,
-    pub active: bool,
-    pub bgw_index: u32,
-}
+/// Decrypt a .himitsu file that contains a tar archive (folder).
+#[tauri::command]
+pub fn decrypt_to_folder(
+    input_path: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<DecryptFileResult, String> {
+    let db = state.db.lock().unwrap();
+    let rk = super::keys::load_active_rk(&db)?;
+    drop(db);
 
-/// Helper: load active receiver key from DB.
-fn load_active_rk(db: &crate::storage::db::Database) -> std::result::Result<crate::storage::models::ReceiverKey, String> {
-    use crate::storage::models::ReceiverKey;
-    use crate::storage::schema::CF_RECEIVER;
+    let ct_bytes = std::fs::read(&input_path)
+        .map_err(|e| format!("Failed to read ciphertext file: {e}"))?;
+    let broadcast_ct: BroadcastCiphertext =
+        bincode::deserialize(&ct_bytes)
+            .map_err(|e| format!("Invalid ciphertext file: {e}"))?;
 
-    let active_id = db.get_cf(CF_RECEIVER, b"__active__")
-        .map_err(|e| e.to_string())?
-        .ok_or("No decryption key loaded. Go to the Receiver tab and import a key first.")?;
-    let rk_data = db.get_cf(CF_RECEIVER, &active_id)
-        .map_err(|e| e.to_string())?
-        .ok_or("Active receiver key not found")?;
-    bincode::deserialize::<ReceiverKey>(&rk_data).map_err(|e| e.to_string())
+    let bgw_guard = state.bgw.lock().unwrap();
+    let bgw_sys = bgw_guard.as_ref().ok_or("BGW system not initialized")?;
+
+    let plaintext = bgw::decrypt(bgw_sys, rk.bgw_index, &rk.usk_bytes, &broadcast_ct)
+        .map_err(|e| {
+            tracing::error!(error = %e, "Folder decryption failed");
+            e.to_string()
+        })?;
+
+    let dir = std::env::temp_dir().join("himitsu");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let out_dir = dir.join(format!("dir_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
+
+    let cursor = std::io::Cursor::new(&plaintext);
+    let mut archive = tar::Archive::new(cursor);
+    archive.unpack(&out_dir)
+        .map_err(|e| format!("Failed to untar: {e}"))?;
+
+    tracing::info!(
+        input_path = %input_path,
+        output_dir = %out_dir.display(),
+        plaintext_size = plaintext.len(),
+        "Folder decrypted and extracted"
+    );
+
+    Ok(DecryptFileResult {
+        size: plaintext.len(),
+        mime: "inode/directory".into(),
+        extension: String::new(),
+        temp_path: out_dir.display().to_string(),
+        category: "Folder".into(),
+        preview_base64: None,
+        preview_data_url: None,
+    })
 }

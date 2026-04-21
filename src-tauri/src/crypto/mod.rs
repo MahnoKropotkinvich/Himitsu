@@ -1,4 +1,3 @@
-pub mod gpg_ops;
-pub mod broadcast;
+pub mod bgw;
+pub mod gpg;
 pub mod fingerprint;
-pub mod key_mgmt;

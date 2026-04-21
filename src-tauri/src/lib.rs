@@ -1,8 +1,8 @@
 pub mod commands;
 pub mod crypto;
 pub mod error;
-pub mod ledger;
 pub mod storage;
+pub mod util;
 
 use storage::db::Database;
 use std::sync::Mutex;
@@ -13,12 +13,11 @@ pub struct AppState {
     pub db: Mutex<Database>,
     pub temp_files: Mutex<Vec<std::path::PathBuf>>,
     /// Live BGW broadcast encryption system (kept in memory).
-    pub bgw: Mutex<Option<crypto::broadcast::BgwSystem>>,
+    pub bgw: Mutex<Option<crypto::bgw::BgwSystem>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Initialize structured logging
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -45,27 +44,34 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(state)
         .invoke_handler(tauri::generate_handler![
-            commands::broadcast::ensure_initialized,
-            commands::broadcast::import_and_assign,
-            commands::broadcast::download_user_key,
-            commands::broadcast::export_user_key,
-            commands::broadcast::set_user_revoked,
-            commands::broadcast::delete_user,
-            commands::gpg::import_gpg_public_key,
-            commands::gpg::list_gpg_keys,
+            // System
+            commands::system::ensure_initialized,
+            // Subscribers
+            commands::subscribers::import_and_assign,
+            commands::subscribers::import_gpg_public_key,
+            commands::subscribers::list_gpg_keys,
+            commands::subscribers::set_user_revoked,
+            commands::subscribers::delete_user,
+            // Keys
+            commands::keys::download_user_key,
+            commands::keys::export_user_key,
+            commands::keys::import_receiver_key,
+            commands::keys::list_receiver_keys,
+            commands::keys::set_active_receiver_key,
+            commands::keys::delete_receiver_key,
+            commands::keys::load_active_receiver_key,
+            // Encrypt
+            commands::encrypt::encrypt_file,
+            commands::encrypt::encrypt_folder,
+            // Decrypt
             commands::decrypt::decrypt_content,
             commands::decrypt::decrypt_and_open,
-            commands::decrypt::import_receiver_key,
-            commands::decrypt::list_receiver_keys,
-            commands::decrypt::set_active_receiver_key,
-            commands::decrypt::delete_receiver_key,
-            commands::decrypt::load_active_receiver_key,
-            commands::file_crypto::encrypt_file,
-            commands::file_crypto::encrypt_folder,
-            commands::file_crypto::decrypt_file,
-            commands::file_crypto::decrypt_to_folder,
-            commands::file_crypto::save_temp_file,
-            commands::file_crypto::get_file_info,
+            commands::decrypt::decrypt_file,
+            commands::decrypt::decrypt_to_folder,
+            // Files
+            commands::files::get_file_info,
+            commands::files::save_temp_file,
+            // Ledger
             commands::ledger::get_ledger_entries,
             commands::ledger::search_ledger,
         ])
