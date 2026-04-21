@@ -12,6 +12,8 @@ use tauri::Manager;
 pub struct AppState {
     pub db: Mutex<Database>,
     pub temp_files: Mutex<Vec<std::path::PathBuf>>,
+    /// Live BGW broadcast encryption system (kept in memory).
+    pub bgw: Mutex<Option<crypto::broadcast::BgwSystem>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -35,6 +37,7 @@ pub fn run() {
     let state = AppState {
         db: Mutex::new(db),
         temp_files: Mutex::new(Vec::new()),
+        bgw: Mutex::new(None),
     };
 
     tauri::Builder::default()
@@ -43,15 +46,11 @@ pub fn run() {
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             commands::broadcast::ensure_initialized,
-            commands::broadcast::setup_broadcast,
             commands::broadcast::import_and_assign,
-            commands::broadcast::generate_user_key,
-            commands::broadcast::encrypt_broadcast,
-            commands::broadcast::revoke_user,
-            commands::broadcast::set_user_revoked,
-            commands::broadcast::delete_user,
             commands::broadcast::download_user_key,
             commands::broadcast::export_user_key,
+            commands::broadcast::set_user_revoked,
+            commands::broadcast::delete_user,
             commands::gpg::import_gpg_public_key,
             commands::gpg::list_gpg_keys,
             commands::decrypt::decrypt_content,

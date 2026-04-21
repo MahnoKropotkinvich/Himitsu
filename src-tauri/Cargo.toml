@@ -1,10 +1,10 @@
 [workspace]
-members = [".", "crates/cifer-sys", "crates/himitsu-trace"]
+members = [".", "crates/pbc-bkem-sys", "crates/himitsu-trace"]
 resolver = "2"
 
 [package]
 name = "himitsu"
-version = "0.1.4"
+version = "0.2.0"
 description = "Broadcast encryption key management with traitor tracing"
 authors = ["you"]
 edition = "2021"
@@ -30,9 +30,8 @@ bincode = "1"
 # GPG (OpenPGP)
 pgp = "0.14"
 
-# Broadcast encryption
-cosmian_cover_crypt = "16"
-cosmian_crypto_core = "=11.0.0"
+# Broadcast encryption (BGW via PBC)
+pbc-bkem-sys = { path = "crates/pbc-bkem-sys" }
 aes-gcm = "0.10"
 
 # File type detection
@@ -56,10 +55,9 @@ num-bigint = "0.4"
 num-traits = "0.2"
 base64 = "0.22"
 hex = "0.4"
+sha2 = "0.10"
+libc = "0.2"
 
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# CiFEr FFI
-cifer-sys = { path = "crates/cifer-sys" }

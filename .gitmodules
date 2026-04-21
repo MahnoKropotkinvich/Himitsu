@@ -1,3 +1,9 @@
 [submodule "src-tauri/vendor/CiFEr"]
 	path = src-tauri/vendor/CiFEr
 	url = https://github.com/fentec-project/CiFEr.git
+[submodule "src-tauri/vendor/PBC_BKEM"]
+	path = src-tauri/vendor/PBC_BKEM
+	url = https://github.com/oliverguenther/PBC_BKEM.git
+[submodule "src-tauri/vendor/pbc"]
+	path = src-tauri/vendor/pbc
+	url = https://github.com/blynn/pbc.git

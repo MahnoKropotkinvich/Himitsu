@@ -74,7 +74,6 @@ jobs:
             librsvg2-dev \
             libglib2.0-dev \
             libgmp-dev \
-            libsodium-dev \
             clang \
             libclang-dev \
             pkg-config
@@ -83,7 +82,7 @@ jobs:
       - name: macOS system dependencies
         if: runner.os == 'macOS'
         run: |
-          brew install gmp libsodium
+          brew install gmp
 
       # ── Windows system deps (vcpkg + cache) ─────────────────
       - name: Set VCPKG_ROOT (Windows)
@@ -96,14 +95,21 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.VCPKG_INSTALLATION_ROOT }}/installed
-          key: vcpkg-x64-windows-static-md-openssl
+          key: vcpkg-x64-windows-gmp
 
-      - name: Install OpenSSL via vcpkg (Windows)
+      - name: Install GMP via vcpkg (Windows)
         if: runner.os == 'Windows'
-        run: vcpkg install openssl:x64-windows-static-md
+        run: vcpkg install gmp:x64-windows-static-md
 
-      # ── CiFEr git submodule ────────────────────────────────────
-      - name: Update CiFEr submodule
+      - name: Set vcpkg env (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          echo "GMP_LIB_DIR=$VCPKG_INSTALLATION_ROOT/installed/x64-windows-static-md/lib" >> $GITHUB_ENV
+          echo "C_INCLUDE_PATH=$VCPKG_INSTALLATION_ROOT/installed/x64-windows-static-md/include" >> $GITHUB_ENV
+
+      # ── Git submodules (PBC + PBC_BKEM) ───────────────────────────
+      - name: Update submodules
         run: git submodule update --init --recursive
 
       # ── Build ─────────────────────────────────────────────────

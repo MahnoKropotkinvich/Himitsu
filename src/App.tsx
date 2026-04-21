@@ -52,7 +52,7 @@ export default function App() {
       </nav>
 
       <main className="main-content">
-        {tab === "workspace" && <Workspace uskB64={uskB64} />}
+        {tab === "workspace" && <Workspace />}
         {tab === "distributor" && <DistributorSettings />}
         {tab === "receiver" && <ReceiverSettings onKeyChanged={loadActiveKey} />}
       </main>
