@@ -10,15 +10,10 @@ interface Applicant {
   revoked: boolean;
 }
 
-interface SetRevokedResult {
-  refreshed_users: string[];
-}
-
 export default function DistributorSettings() {
   const [users, setUsers] = useState<Applicant[]>([]);
   const [view, setView] = useState<"list" | "add">("list");
   const [status, setStatus] = useState<{ ok: boolean; msg: string } | null>(null);
-  const [redistNotice, setRedistNotice] = useState<{ names: string[]; action: string } | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<Applicant | null>(null);
 
   const refresh = async () => {
@@ -29,12 +24,9 @@ export default function DistributorSettings() {
 
   const toggleRevoke = async (user: Applicant) => {
     try {
-      const result = await invoke<SetRevokedResult>("set_user_revoked", { userId: user.user_id, revoked: !user.revoked });
+      await invoke("set_user_revoked", { userId: user.user_id, revoked: !user.revoked });
       const action = user.revoked ? "restored" : "revoked";
-      setStatus({ ok: true, msg: `${user.display_name} ${action}.` });
-      if (result.refreshed_users.length > 0) {
-        setRedistNotice({ names: result.refreshed_users, action });
-      }
+      setStatus({ ok: true, msg: `${user.display_name} ${action}. No key updates needed.` });
       refresh();
     } catch (e: any) {
       setStatus({ ok: false, msg: String(e) });
@@ -150,35 +142,6 @@ export default function DistributorSettings() {
           </div>
         )}
       </div>
-
-      {/* Key redistribution reminder */}
-      {redistNotice && (
-        <div className="dialog-overlay" onClick={() => setRedistNotice(null)}>
-          <div className="dialog" onClick={(e) => e.stopPropagation()}>
-            <h3>Key Redistribution Required</h3>
-            <p>
-              The following subscriber{redistNotice.names.length > 1 ? "s have" : " has"} had their
-              broadcast key refreshed server-side:
-            </p>
-            <ul style={{ margin: "8px 0", paddingLeft: 20 }}>
-              {redistNotice.names.map((n) => (
-                <li key={n}><strong>{n}</strong></li>
-              ))}
-            </ul>
-            <p>
-              Please use the <strong>Key &darr;</strong> button to download
-              {redistNotice.names.length > 1 ? " their" : " the"} updated key
-              file{redistNotice.names.length > 1 ? "s" : ""} and send{" "}
-              {redistNotice.names.length > 1 ? "them" : "it"} to{" "}
-              {redistNotice.names.length > 1 ? "each subscriber" : "this subscriber"}.
-              They must re-import the new key to decrypt future content.
-            </p>
-            <div className="btn-row" style={{ justifyContent: "flex-end" }}>
-              <button className="btn btn-primary" onClick={() => setRedistNotice(null)}>Understood</button>
-            </div>
-          </div>
-        </div>
-      )}
 
       {/* Delete confirmation */}
       {confirmDelete && (

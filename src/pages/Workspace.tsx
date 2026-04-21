@@ -82,7 +82,7 @@ function hasPreview(data: PreviewData | null): boolean {
   return !!data && !!data.preview_base64 && ["Image", "Video", "Audio", "Text", "Pdf"].includes(data.category);
 }
 
-export default function Workspace({ uskB64 }: { uskB64: string }) {
+export default function Workspace() {
   // Left pane
   const [leftPath, setLeftPath] = useState<string | null>(null);
   const [leftName, setLeftName] = useState("");
@@ -172,7 +172,6 @@ export default function Workspace({ uskB64 }: { uskB64: string }) {
       const cmd = leftIsDir ? "encrypt_folder" : "encrypt_file";
       const result: EncryptFileResult = await invoke(cmd, {
         inputPath: leftPath,
-        policy: "Access::Broadcast",
       });
       setRightPath(result.output_path);
       setRightName((leftName || "file") + ".himitsu");
@@ -187,10 +186,6 @@ export default function Workspace({ uskB64 }: { uskB64: string }) {
   // --- Decrypt ---
   const handleDecrypt = async () => {
     if (!rightPath) return;
-    if (!uskB64) {
-      setDialog("No decryption key loaded.\nGo to the Receiver tab and import a key first.");
-      return;
-    }
     setBusy(true);
     try {
       const result: DecryptFileResult = await invoke("decrypt_file", {

@@ -9,9 +9,6 @@ name = "himitsu-trace"
 path = "src/main.rs"
 
 [dependencies]
-# Shared crypto primitives
-cifer-sys = { path = "../cifer-sys" }
-
 # Data access (read-only access to the ledger DB)
 rocksdb = { version = "0.24", default-features = false, features = ["snappy"] }
 bincode = "1"

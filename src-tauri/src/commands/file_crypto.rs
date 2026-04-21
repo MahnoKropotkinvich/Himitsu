@@ -2,9 +2,9 @@ use serde::Serialize;
 use tauri::State;
 
 use crate::AppState;
-use crate::crypto::cover_crypt_ops;
-use crate::storage::schema::CF_MASTER_KEYS;
+use crate::crypto::broadcast;
 use super::file_opener;
+use super::broadcast as broadcast_cmds;
 
 /// Size threshold for inline preview (10 MiB).
 const INLINE_PREVIEW_MAX: usize = 10 << 20;
@@ -139,14 +139,12 @@ pub struct DecryptFileResult {
     pub preview_data_url: Option<String>,
 }
 
-/// Encrypt a file on disk.
+/// Encrypt a file on disk using BGW broadcast encryption.
 ///
-/// Reads plaintext from `input_path`, encrypts it, writes ciphertext to a
-/// temp file.  Returns the temp path and sizes.
+/// Encrypts for all non-revoked users.
 #[tauri::command]
 pub fn encrypt_file(
     input_path: String,
-    policy: String,
     state: State<'_, AppState>,
 ) -> std::result::Result<EncryptFileResult, String> {
     use std::io::BufWriter;
@@ -155,17 +153,22 @@ pub fn encrypt_file(
         .map_err(|e| format!("Failed to read input file: {e}"))?;
     let input_size = plaintext.len() as u64;
 
+    // Get active recipient indices
     let db = state.db.lock().unwrap();
-    let mpk_bytes = db
-        .get_cf(CF_MASTER_KEYS, b"mpk")
-        .map_err(|e| e.to_string())?
-        .ok_or("Master key not initialized")?;
+    let recipients = broadcast_cmds::get_active_recipient_indices(&db)?;
     drop(db);
 
-    let broadcast_ct = cover_crypt_ops::encrypt(&mpk_bytes, &policy, &plaintext)
+    if recipients.is_empty() {
+        return Err("No active subscribers to encrypt for".into());
+    }
+
+    let bgw_guard = state.bgw.lock().unwrap();
+    let bgw = bgw_guard.as_ref().ok_or("BGW system not initialized")?;
+
+    let broadcast_ct = broadcast::encrypt(bgw, &recipients, &plaintext)
         .map_err(|e| e.to_string())?;
 
-    // Derive output filename from input
+    // Derive output filename
     let input_name = std::path::Path::new(&input_path)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -234,12 +237,15 @@ pub fn decrypt_file(
     let ct_bytes = std::fs::read(&input_path)
         .map_err(|e| format!("Failed to read ciphertext file: {e}"))?;
 
-    let broadcast_ct: cover_crypt_ops::BroadcastCiphertext =
+    let broadcast_ct: broadcast::BroadcastCiphertext =
         bincode::deserialize(&ct_bytes)
             .map_err(|e| format!("Invalid ciphertext file: {e}"))?;
 
-    // 3. Decrypt
-    let plaintext = cover_crypt_ops::decrypt(&rk.usk_bytes, &broadcast_ct)
+    // 3. Decrypt using BGW
+    let bgw_guard = state.bgw.lock().unwrap();
+    let bgw = bgw_guard.as_ref().ok_or("BGW system not initialized")?;
+
+    let plaintext = broadcast::decrypt(bgw, rk.bgw_index, &rk.usk_bytes, &broadcast_ct)
         .map_err(|e| {
             tracing::error!(error = %e, "File decryption failed");
             e.to_string()
@@ -372,7 +378,6 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::
 #[tauri::command]
 pub fn encrypt_folder(
     input_path: String,
-    policy: String,
     state: State<'_, AppState>,
 ) -> std::result::Result<EncryptFileResult, String> {
     use std::io::BufWriter;
@@ -405,13 +410,17 @@ pub fn encrypt_folder(
 
     // 2. Encrypt the tar blob
     let db = state.db.lock().unwrap();
-    let mpk_bytes = db
-        .get_cf(CF_MASTER_KEYS, b"mpk")
-        .map_err(|e| e.to_string())?
-        .ok_or("Master key not initialized")?;
+    let recipients = broadcast_cmds::get_active_recipient_indices(&db)?;
     drop(db);
 
-    let broadcast_ct = cover_crypt_ops::encrypt(&mpk_bytes, &policy, &tar_buf)
+    if recipients.is_empty() {
+        return Err("No active subscribers to encrypt for".into());
+    }
+
+    let bgw_guard = state.bgw.lock().unwrap();
+    let bgw = bgw_guard.as_ref().ok_or("BGW system not initialized")?;
+
+    let broadcast_ct = broadcast::encrypt(bgw, &recipients, &tar_buf)
         .map_err(|e| e.to_string())?;
 
     // 3. Write to temp file
@@ -476,12 +485,15 @@ pub fn decrypt_to_folder(
     // 2. Read ciphertext
     let ct_bytes = std::fs::read(&input_path)
         .map_err(|e| format!("Failed to read ciphertext file: {e}"))?;
-    let broadcast_ct: cover_crypt_ops::BroadcastCiphertext =
+    let broadcast_ct: broadcast::BroadcastCiphertext =
         bincode::deserialize(&ct_bytes)
             .map_err(|e| format!("Invalid ciphertext file: {e}"))?;
 
     // 3. Decrypt
-    let plaintext = cover_crypt_ops::decrypt(&rk.usk_bytes, &broadcast_ct)
+    let bgw_guard = state.bgw.lock().unwrap();
+    let bgw = bgw_guard.as_ref().ok_or("BGW system not initialized")?;
+
+    let plaintext = broadcast::decrypt(bgw, rk.bgw_index, &rk.usk_bytes, &broadcast_ct)
         .map_err(|e| {
             tracing::error!(error = %e, "Folder decryption failed");
             e.to_string()

@@ -43,6 +43,7 @@ fn do_import(armored_key: &str, display_name: &str, state: &AppState) -> Result<
         gpg_public_key_armored: armored_key.to_string(),
         created_at: chrono::Utc::now(),
         revoked: false,
+        bgw_index: u32::MAX, // placeholder — real index assigned by import_and_assign
     };
 
     let db = state.db.lock().unwrap();

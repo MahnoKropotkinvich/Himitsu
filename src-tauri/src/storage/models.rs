@@ -10,6 +10,17 @@ pub struct Applicant {
     pub gpg_public_key_armored: String,
     pub created_at: DateTime<Utc>,
     pub revoked: bool,
+    /// BGW user slot index (0..N-1).
+    pub bgw_index: u32,
+}
+
+/// BGW user key record stored in DB.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserKeyRecord {
+    pub user_id: String,
+    pub bgw_index: u32,
+    /// Raw BGW private key bytes (PBC element serialized).
+    pub key_data: Vec<u8>,
 }
 
 /// Actions recorded in the distribution ledger.
@@ -17,11 +28,10 @@ pub struct Applicant {
 pub enum LedgerAction {
     KeyIssued,
     KeyRevoked,
-    KeyRefreshed,
     CiphertextCreated,
 }
 
-/// A single ledger entry tracking who received what key and when.
+/// A single ledger entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LedgerEntry {
     pub id: String,
@@ -33,15 +43,6 @@ pub struct LedgerEntry {
     pub notes: Option<String>,
 }
 
-/// Metadata stored alongside a ciphertext blob.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CiphertextMeta {
-    pub id: String,
-    pub policy: String,
-    pub created_at: DateTime<Utc>,
-    pub creator_note: Option<String>,
-}
-
 /// Fingerprint vector assigned to a user for traitor tracing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FingerprintRecord {
@@ -51,20 +52,19 @@ pub struct FingerprintRecord {
     pub created_at: DateTime<Utc>,
 }
 
-/// A saved receiver decryption key.
+/// A saved receiver decryption key (BGW private key + user index).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReceiverKey {
     pub id: String,
     pub label: String,
     pub created_at: DateTime<Utc>,
-    /// Decrypted CoverCrypt USK bytes.
+    /// BGW user slot index.
+    pub bgw_index: u32,
+    /// Raw BGW private key bytes.
     pub usk_bytes: Vec<u8>,
 }
 
 /// Result returned to the frontend after decryption.
-///
-/// Contains the render action that tells the frontend how to display
-/// the content (inline via data-URI, external app, or raw hex).
 #[derive(Debug, Clone, Serialize)]
 pub struct DecryptResult {
     pub success: bool,
