@@ -9,6 +9,7 @@ interface FileInfo {
   name: string;
   mime: string;
   category: string;
+  is_dir: boolean;
   preview_base64: string | null;
   preview_data_url: string | null;
 }
@@ -86,6 +87,7 @@ export default function Workspace({ uskB64 }: { uskB64: string }) {
   const [leftPath, setLeftPath] = useState<string | null>(null);
   const [leftName, setLeftName] = useState("");
   const [leftSize, setLeftSize] = useState(0);
+  const [leftIsDir, setLeftIsDir] = useState(false);
   const [leftPreview, setLeftPreview] = useState<PreviewData | null>(null);
 
   // Right pane
@@ -106,6 +108,7 @@ export default function Workspace({ uskB64 }: { uskB64: string }) {
       setLeftPath(filePath);
       setLeftName(info.name);
       setLeftSize(info.size);
+      setLeftIsDir(info.is_dir);
       setLeftPreview({
         category: info.category,
         preview_base64: info.preview_base64,
@@ -166,7 +169,8 @@ export default function Workspace({ uskB64 }: { uskB64: string }) {
     if (!leftPath) return;
     setBusy(true);
     try {
-      const result: EncryptFileResult = await invoke("encrypt_file", {
+      const cmd = leftIsDir ? "encrypt_folder" : "encrypt_file";
+      const result: EncryptFileResult = await invoke(cmd, {
         inputPath: leftPath,
         policy: "Access::Broadcast",
       });
@@ -193,8 +197,10 @@ export default function Workspace({ uskB64 }: { uskB64: string }) {
         inputPath: rightPath,
       });
       setDecryptResult(result);
-      setLeftName("decrypted." + result.extension);
+      const isFolder = result.category === "Folder";
+      setLeftName(isFolder ? result.temp_path.split(/[/\\]/).pop() || "folder" : "decrypted." + result.extension);
       setLeftSize(result.size);
+      setLeftIsDir(isFolder);
       setLeftPath(result.temp_path);
       setLeftPreview({
         category: result.category,
@@ -231,7 +237,7 @@ export default function Workspace({ uskB64 }: { uskB64: string }) {
     }
   };
 
-  const clearLeft = () => { setLeftPath(null); setLeftName(""); setLeftSize(0); setLeftPreview(null); setDecryptResult(null); };
+  const clearLeft = () => { setLeftPath(null); setLeftName(""); setLeftSize(0); setLeftIsDir(false); setLeftPreview(null); setDecryptResult(null); };
   const clearRight = () => { setRightPath(null); setRightName(""); setRightSize(0); };
 
   return (
@@ -260,7 +266,7 @@ export default function Workspace({ uskB64 }: { uskB64: string }) {
                   <InlinePreview data={leftPreview!} />
                 ) : (
                   <div className="binary-info">
-                    <div className="binary-size">{formatBytes(leftSize)}</div>
+                    <div className="binary-size">{leftIsDir ? "Folder" : ""} {formatBytes(leftSize)}</div>
                     <div className="binary-name">{leftName}</div>
                   </div>
                 )}

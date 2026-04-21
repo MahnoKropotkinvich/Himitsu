@@ -1,0 +1,98 @@
+# Cirrus CI — backup CI for Himitsu
+# Docs: https://cirrus-ci.org/guide/writing-tasks/
+# Free tier: unlimited for public repos on Linux, limited on Windows/macOS
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+# ── Linux (Ubuntu, container) ──────────────────────────────────
+linux_task:
+  name: Build (x86_64-unknown-linux-gnu)
+  container:
+    image: ubuntu:22.04
+    cpu: 4
+    memory: 8G
+  env:
+    DEBIAN_FRONTEND: noninteractive
+  install_deps_script:
+    - apt-get update
+    - apt-get install -y
+        build-essential curl git pkg-config
+        libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev
+        librsvg2-dev libglib2.0-dev libgmp-dev libsodium-dev libssl-dev
+        clang libclang-dev
+        nodejs npm
+  install_rust_script:
+    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+    - source "$HOME/.cargo/env" && rustup target add x86_64-unknown-linux-gnu
+  cargo_cache:
+    folder: $HOME/.cargo/registry
+    fingerprint_script: cat src-tauri/Cargo.lock
+  target_cache:
+    folder: src-tauri/target
+    fingerprint_script: cat src-tauri/Cargo.lock
+  frontend_script:
+    - npm ci
+  build_script:
+    - source "$HOME/.cargo/env"
+    - git submodule update --init --recursive
+    - npm run tauri build -- --target x86_64-unknown-linux-gnu
+
+# ── Windows (MSVC + vcpkg) ─────────────────────────────────────
+windows_task:
+  name: Build (x86_64-pc-windows-msvc)
+  windows_container:
+    image: cirrusci/windowsservercore:visualstudio2022
+    cpu: 4
+    memory: 8G
+  env:
+    VCPKG_ROOT: C:\vcpkg
+  install_node_script:
+    - choco install nodejs-lts --no-progress -y
+    - refreshenv
+  install_rust_script:
+    - choco install rustup.install --no-progress -y
+    - refreshenv
+    - rustup default stable-x86_64-pc-windows-msvc
+  vcpkg_cache:
+    folder: C:\vcpkg\installed
+    fingerprint_key: vcpkg-openssl-x64-windows-static-md-v1
+  vcpkg_install_script:
+    - vcpkg install openssl:x64-windows-static-md
+  cargo_cache:
+    folder: '%USERPROFILE%\.cargo\registry'
+    fingerprint_script: type src-tauri\Cargo.lock
+  target_cache:
+    folder: src-tauri\target
+    fingerprint_script: type src-tauri\Cargo.lock
+  frontend_script:
+    - npm ci
+  build_script:
+    - git submodule update --init --recursive
+    - npm run tauri build -- --target x86_64-pc-windows-msvc
+
+# ── macOS (Homebrew) ───────────────────────────────────────────
+macos_task:
+  name: Build (aarch64-apple-darwin)
+  macos_instance:
+    image: ghcr.io/cirruslabs/macos-runner:sonoma
+  install_deps_script:
+    - brew install gmp libsodium
+  install_rust_script:
+    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+    - source "$HOME/.cargo/env" && rustup target add aarch64-apple-darwin
+  install_node_script:
+    - brew install node
+  cargo_cache:
+    folder: $HOME/.cargo/registry
+    fingerprint_script: cat src-tauri/Cargo.lock
+  target_cache:
+    folder: src-tauri/target
+    fingerprint_script: cat src-tauri/Cargo.lock
+  frontend_script:
+    - npm ci
+  build_script:
+    - source "$HOME/.cargo/env"
+    - git submodule update --init --recursive
+    - npm run tauri build -- --target aarch64-apple-darwin

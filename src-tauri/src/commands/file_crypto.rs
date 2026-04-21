@@ -16,29 +16,65 @@ pub struct FileInfo {
     pub name: String,
     pub mime: String,
     pub category: String,
+    pub is_dir: bool,
     /// base64 data for inline preview (only for renderable files < 10 MiB).
     pub preview_base64: Option<String>,
     /// Pre-built data URI for inline preview.
     pub preview_data_url: Option<String>,
 }
 
-/// Return file size and name for a given path.
+/// Recursively compute total size of a directory.
+fn dir_size(path: &std::path::Path) -> u64 {
+    walkdir(path).iter().filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum()
+}
+fn walkdir(path: &std::path::Path) -> Vec<std::fs::DirEntry> {
+    let mut entries = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(path) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                entries.extend(walkdir(&p));
+            } else {
+                entries.push(entry);
+            }
+        }
+    }
+    entries
+}
+
+/// Return file/directory info for a given path.
 /// For small renderable files (< 10 MiB), also returns preview data.
+/// For directories, returns total size and "Folder" category.
 #[tauri::command]
 pub fn get_file_info(path: String) -> std::result::Result<FileInfo, String> {
     use base64::Engine;
 
-    let meta = std::fs::metadata(&path)
-        .map_err(|e| format!("Cannot read file: {e}"))?;
-    let name = std::path::Path::new(&path)
+    let p = std::path::Path::new(&path);
+    let meta = std::fs::metadata(p)
+        .map_err(|e| format!("Cannot read path: {e}"))?;
+    let name = p
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
+
+    // Directory
+    if meta.is_dir() {
+        let size = dir_size(p);
+        return Ok(FileInfo {
+            size, name,
+            mime: "inode/directory".into(),
+            category: "Folder".into(),
+            is_dir: true,
+            preview_base64: None,
+            preview_data_url: None,
+        });
+    }
+
     let size = meta.len();
 
     // For small files, read content and detect type for preview
     if size <= INLINE_PREVIEW_MAX as u64 {
-        if let Ok(data) = std::fs::read(&path) {
+        if let Ok(data) = std::fs::read(p) {
             let ft = file_opener::detect_file_type(&data);
             let (mime, category) = match &ft {
                 Some(f) => {
@@ -59,14 +95,14 @@ pub fn get_file_info(path: String) -> std::result::Result<FileInfo, String> {
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
                 let data_url = format!("data:{};base64,{}", mime, b64);
                 return Ok(FileInfo {
-                    size, name, mime, category,
+                    size, name, mime, category, is_dir: false,
                     preview_base64: Some(b64),
                     preview_data_url: Some(data_url),
                 });
             }
 
             return Ok(FileInfo {
-                size, name, mime, category,
+                size, name, mime, category, is_dir: false,
                 preview_base64: None,
                 preview_data_url: None,
             });
@@ -77,6 +113,7 @@ pub fn get_file_info(path: String) -> std::result::Result<FileInfo, String> {
         size, name,
         mime: "application/octet-stream".into(),
         category: "Binary".into(),
+        is_dir: false,
         preview_base64: None,
         preview_data_url: None,
     })
@@ -208,7 +245,42 @@ pub fn decrypt_file(
             e.to_string()
         })?;
 
-    // 4. Detect file type
+    // 4. Check if decrypted content is a tar archive (encrypted folder)
+    //    tar magic: bytes 257..262 == "ustar"
+    let is_tar = plaintext.len() > 262 && &plaintext[257..262] == b"ustar";
+
+    if is_tar {
+        // Extract to temp directory
+        let dir = std::env::temp_dir().join("himitsu");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let out_dir = dir.join(format!("dir_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
+
+        let cursor = std::io::Cursor::new(&plaintext);
+        let mut archive = tar::Archive::new(cursor);
+        archive
+            .unpack(&out_dir)
+            .map_err(|e| format!("Failed to untar: {e}"))?;
+
+        tracing::info!(
+            input_path = %input_path,
+            output_dir = %out_dir.display(),
+            tar_size = plaintext.len(),
+            "Decrypted folder extracted"
+        );
+
+        return Ok(DecryptFileResult {
+            size: plaintext.len(),
+            mime: "inode/directory".into(),
+            extension: String::new(),
+            temp_path: out_dir.display().to_string(),
+            category: "Folder".into(),
+            preview_base64: None,
+            preview_data_url: None,
+        });
+    }
+
+    // 5. Detect file type (regular file)
     let ft = file_opener::detect_file_type(&plaintext);
     let (mime, extension, category) = match &ft {
         Some(f) => {
@@ -269,8 +341,178 @@ pub fn save_temp_file(
     temp_path: String,
     dest_path: String,
 ) -> std::result::Result<(), String> {
-    std::fs::copy(&temp_path, &dest_path)
-        .map_err(|e| format!("Failed to save file: {e}"))?;
+    let src = std::path::Path::new(&temp_path);
+    let dst = std::path::Path::new(&dest_path);
+    if src.is_dir() {
+        // Copy directory recursively
+        copy_dir_recursive(src, dst).map_err(|e| format!("Failed to save folder: {e}"))?;
+    } else {
+        std::fs::copy(src, dst)
+            .map_err(|e| format!("Failed to save file: {e}"))?;
+    }
     tracing::info!(src = %temp_path, dest = %dest_path, "Temp file saved");
     Ok(())
+}
+
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let dest_child = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_recursive(&entry.path(), &dest_child)?;
+        } else {
+            std::fs::copy(entry.path(), &dest_child)?;
+        }
+    }
+    Ok(())
+}
+
+/// Encrypt a folder: tar → encrypt → single .himitsu temp file.
+#[tauri::command]
+pub fn encrypt_folder(
+    input_path: String,
+    policy: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<EncryptFileResult, String> {
+    use std::io::BufWriter;
+
+    let src = std::path::Path::new(&input_path);
+    if !src.is_dir() {
+        return Err("Path is not a directory".into());
+    }
+
+    // 1. Tar the directory into memory
+    let mut tar_buf = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut tar_buf);
+        let dir_name = src.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "folder".into());
+        builder
+            .append_dir_all(&dir_name, src)
+            .map_err(|e| format!("Failed to tar directory: {e}"))?;
+        builder
+            .finish()
+            .map_err(|e| format!("Failed to finalize tar: {e}"))?;
+    }
+    let input_size = tar_buf.len() as u64;
+
+    tracing::debug!(
+        tar_size = tar_buf.len(),
+        "Folder tarred"
+    );
+
+    // 2. Encrypt the tar blob
+    let db = state.db.lock().unwrap();
+    let mpk_bytes = db
+        .get_cf(CF_MASTER_KEYS, b"mpk")
+        .map_err(|e| e.to_string())?
+        .ok_or("Master key not initialized")?;
+    drop(db);
+
+    let broadcast_ct = cover_crypt_ops::encrypt(&mpk_bytes, &policy, &tar_buf)
+        .map_err(|e| e.to_string())?;
+
+    // 3. Write to temp file
+    let folder_name = src.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "folder".into());
+
+    let dir = std::env::temp_dir().join("himitsu");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let output_path = dir.join(format!("{}.himitsu", folder_name));
+
+    let file = std::fs::File::create(&output_path)
+        .map_err(|e| format!("Failed to create output file: {e}"))?;
+    let writer = BufWriter::new(file);
+    bincode::serialize_into(writer, &broadcast_ct)
+        .map_err(|e| format!("Failed to write ciphertext: {e}"))?;
+
+    let output_size = std::fs::metadata(&output_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    state.temp_files.lock().unwrap().push(output_path.clone());
+
+    tracing::info!(
+        input_path = %input_path,
+        output_path = %output_path.display(),
+        input_size,
+        output_size,
+        "Folder encrypted"
+    );
+
+    Ok(EncryptFileResult {
+        input_size,
+        output_size,
+        output_path: output_path.display().to_string(),
+    })
+}
+
+/// Decrypt a .himitsu file that contains a tar archive (folder).
+/// Extracts to a temp directory and returns the path.
+#[tauri::command]
+pub fn decrypt_to_folder(
+    input_path: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<DecryptFileResult, String> {
+    use crate::storage::models::ReceiverKey;
+    use crate::storage::schema::CF_RECEIVER;
+
+    // 1. Load active receiver key
+    let db = state.db.lock().unwrap();
+    let active_id = db
+        .get_cf(CF_RECEIVER, b"__active__")
+        .map_err(|e| e.to_string())?
+        .ok_or("No decryption key loaded. Go to the Receiver tab and import a key first.")?;
+    let rk_data = db
+        .get_cf(CF_RECEIVER, &active_id)
+        .map_err(|e| e.to_string())?
+        .ok_or("Active receiver key not found in database")?;
+    let rk: ReceiverKey = bincode::deserialize(&rk_data).map_err(|e| e.to_string())?;
+    drop(db);
+
+    // 2. Read ciphertext
+    let ct_bytes = std::fs::read(&input_path)
+        .map_err(|e| format!("Failed to read ciphertext file: {e}"))?;
+    let broadcast_ct: cover_crypt_ops::BroadcastCiphertext =
+        bincode::deserialize(&ct_bytes)
+            .map_err(|e| format!("Invalid ciphertext file: {e}"))?;
+
+    // 3. Decrypt
+    let plaintext = cover_crypt_ops::decrypt(&rk.usk_bytes, &broadcast_ct)
+        .map_err(|e| {
+            tracing::error!(error = %e, "Folder decryption failed");
+            e.to_string()
+        })?;
+
+    // 4. Untar to temp directory
+    let dir = std::env::temp_dir().join("himitsu");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let out_dir = dir.join(format!("dir_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
+
+    let cursor = std::io::Cursor::new(&plaintext);
+    let mut archive = tar::Archive::new(cursor);
+    archive
+        .unpack(&out_dir)
+        .map_err(|e| format!("Failed to untar: {e}"))?;
+
+    tracing::info!(
+        input_path = %input_path,
+        output_dir = %out_dir.display(),
+        plaintext_size = plaintext.len(),
+        "Folder decrypted and extracted"
+    );
+
+    Ok(DecryptFileResult {
+        size: plaintext.len(),
+        mime: "inode/directory".into(),
+        extension: String::new(),
+        temp_path: out_dir.display().to_string(),
+        category: "Folder".into(),
+        preview_base64: None,
+        preview_data_url: None,
+    })
 }
