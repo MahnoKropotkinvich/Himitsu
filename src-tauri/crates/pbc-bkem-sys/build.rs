@@ -11,15 +11,20 @@ fn main() {
         return;
     }
 
+    let dep_paths = DepPaths::detect();
+
     // --- GMP: always require system library ---
     println!("cargo:rustc-link-lib=gmp");
+    for p in &dep_paths.lib_search {
+        println!("cargo:rustc-link-search={}", p.display());
+    }
 
     // --- PBC: prefer system library, fall back to vendored source ---
-    let use_system_pbc = try_system_pbc();
+    let use_system_pbc = try_system_pbc(&dep_paths);
 
     if !use_system_pbc {
         println!("cargo:warning=System libpbc not found, building from vendored source");
-        build_vendored_pbc();
+        build_vendored_pbc(&dep_paths);
     }
 
     // --- Build bkem.c (from submodule) + bkem_helpers.c (local to this crate) ---
@@ -28,35 +33,20 @@ fn main() {
         .file(&bkem_c)
         .file(manifest_dir.join("bkem_helpers.c"))
         .include(&bkem_dir)
-        // Always include GMP system paths (GMP is a hard system dependency)
-        .include("/opt/homebrew/include")
-        .include("/usr/local/include")
-        .include("/usr/include")
         .warnings(false);
 
+    for p in &dep_paths.include {
+        bkem_build.include(p);
+    }
+
     if use_system_pbc {
-        // System PBC headers
-        bkem_build.include("/opt/homebrew/include");
-        bkem_build.include("/usr/local/include");
-        bkem_build.include("/usr/include");
+        // System PBC headers already covered by dep_paths.include
     } else {
-        // Vendored PBC: include parent of `include/` so `#include <pbc/pbc.h>` resolves
-        // PBC header is at vendor/pbc/include/pbc.h, and bkem wants <pbc/pbc.h>
-        // So we need a directory where pbc/ subdirectory contains pbc.h
-        // Solution: create a symlink or pass the right include path
+        // Vendored PBC: create shim so `#include <pbc/pbc.h>` resolves
         let pbc_dir = bkem_dir.join("../pbc");
-        // PBC's include dir has pbc.h directly. We need <pbc/pbc.h> to resolve.
-        // The parent of the include dir works if include/ were named pbc/.
-        // Workaround: pass include's parent and also include itself as "pbc" alias.
-        // Actually simplest: the pbc repo has include/pbc.h and include/pbc_*.h
-        // We need #include <pbc/pbc.h> → so pass the directory ABOVE include/
-        // But that won't work because the file is include/pbc.h not include/pbc/pbc.h
-        //
-        // Real fix: create a shim directory structure in OUT_DIR
         let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
         let shim_dir = out_dir.join("pbc_include/pbc");
         std::fs::create_dir_all(&shim_dir).unwrap();
-        // Symlink all PBC headers into the shim pbc/ directory
         let pbc_include = pbc_dir.join("include");
         if let Ok(entries) = std::fs::read_dir(&pbc_include) {
             for entry in entries.flatten() {
@@ -76,19 +66,15 @@ fn main() {
     bkem_build.compile("bkem");
 
     // --- Generate Rust bindings ---
-    // bkem_wrapper.h is local to this crate; it includes bkem.h from the submodule
     let mut bindgen_builder = bindgen::Builder::default()
         .header(manifest_dir.join("bkem_wrapper.h").to_str().unwrap())
-        .clang_arg(format!("-I{}", bkem_dir.display()))
-        // GMP system headers (always needed)
-        .clang_arg("-I/opt/homebrew/include")
-        .clang_arg("-I/usr/local/include");
+        .clang_arg(format!("-I{}", bkem_dir.display()));
 
-    if use_system_pbc {
-        bindgen_builder = bindgen_builder
-            .clang_arg("-I/opt/homebrew/include")
-            .clang_arg("-I/usr/local/include");
-    } else {
+    for p in &dep_paths.include {
+        bindgen_builder = bindgen_builder.clang_arg(format!("-I{}", p.display()));
+    }
+
+    if !use_system_pbc {
         let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
         let pbc_dir = bkem_dir.join("../pbc");
         bindgen_builder = bindgen_builder
@@ -126,50 +112,114 @@ fn main() {
     println!("cargo:rerun-if-changed={}", manifest_dir.join("bkem_helpers.c").display());
 }
 
-/// Try to find system-installed libpbc via pkg-config or common paths.
-fn try_system_pbc() -> bool {
-    // Try pkg-config first
-    if let Ok(status) = std::process::Command::new("pkg-config")
-        .args(["--exists", "pbc"])
-        .status()
-    {
-        if status.success() {
-            // Use pkg-config to get the right flags
-            if let Ok(output) = std::process::Command::new("pkg-config")
-                .args(["--libs", "pbc"])
-                .output()
-            {
-                let libs = String::from_utf8_lossy(&output.stdout);
-                for token in libs.split_whitespace() {
-                    if let Some(lib) = token.strip_prefix("-l") {
-                        println!("cargo:rustc-link-lib={lib}");
-                    } else if let Some(path) = token.strip_prefix("-L") {
-                        println!("cargo:rustc-link-search={path}");
-                    }
+// ---------------------------------------------------------------------------
+// Platform-aware dependency paths
+// ---------------------------------------------------------------------------
+
+/// Include and library search paths for GMP/PBC, resolved per platform.
+struct DepPaths {
+    include: Vec<PathBuf>,
+    lib_search: Vec<PathBuf>,
+}
+
+impl DepPaths {
+    fn detect() -> Self {
+        let mut include = Vec::new();
+        let mut lib_search = Vec::new();
+
+        // 1. Environment overrides (set by CI or user) take priority.
+        //    GMP_INCLUDE_DIR / GMP_LIB_DIR — used by vcpkg on Windows.
+        if let Ok(dir) = env::var("GMP_INCLUDE_DIR") {
+            include.push(PathBuf::from(dir));
+        }
+        if let Ok(dir) = env::var("GMP_LIB_DIR") {
+            lib_search.push(PathBuf::from(dir));
+        }
+        // Also check the generic C_INCLUDE_PATH / LIBRARY_PATH
+        if let Ok(dirs) = env::var("C_INCLUDE_PATH") {
+            for d in env::split_paths(&dirs) {
+                include.push(d);
+            }
+        }
+        if let Ok(dirs) = env::var("LIBRARY_PATH") {
+            for d in env::split_paths(&dirs) {
+                lib_search.push(d);
+            }
+        }
+
+        // 2. Platform-specific well-known paths (Unix only).
+        //    On Windows these don't exist and would cause cl.exe to error.
+        if !cfg!(target_os = "windows") {
+            let unix_include = [
+                "/opt/homebrew/include",
+                "/usr/local/include",
+                "/usr/include",
+            ];
+            let unix_lib = [
+                "/opt/homebrew/lib",
+                "/usr/local/lib",
+                "/usr/lib",
+                "/usr/lib/x86_64-linux-gnu",
+            ];
+            for p in unix_include {
+                let pb = PathBuf::from(p);
+                if pb.exists() && !include.contains(&pb) {
+                    include.push(pb);
                 }
-                println!("cargo:warning=Using system libpbc (via pkg-config)");
-                return true;
+            }
+            for p in unix_lib {
+                let pb = PathBuf::from(p);
+                if pb.exists() && !lib_search.contains(&pb) {
+                    lib_search.push(pb);
+                }
+            }
+        }
+
+        DepPaths { include, lib_search }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// System PBC detection
+// ---------------------------------------------------------------------------
+
+fn try_system_pbc(dep: &DepPaths) -> bool {
+    // pkg-config (Unix)
+    if !cfg!(target_os = "windows") {
+        if let Ok(status) = std::process::Command::new("pkg-config")
+            .args(["--exists", "pbc"])
+            .status()
+        {
+            if status.success() {
+                if let Ok(output) = std::process::Command::new("pkg-config")
+                    .args(["--libs", "pbc"])
+                    .output()
+                {
+                    let libs = String::from_utf8_lossy(&output.stdout);
+                    for token in libs.split_whitespace() {
+                        if let Some(lib) = token.strip_prefix("-l") {
+                            println!("cargo:rustc-link-lib={lib}");
+                        } else if let Some(path) = token.strip_prefix("-L") {
+                            println!("cargo:rustc-link-search={path}");
+                        }
+                    }
+                    println!("cargo:warning=Using system libpbc (via pkg-config)");
+                    return true;
+                }
             }
         }
     }
 
-    // Try common library paths directly
-    let search_paths = [
-        "/opt/homebrew/lib",
-        "/usr/local/lib",
-        "/usr/lib",
-        "/usr/lib/x86_64-linux-gnu",
-    ];
-
-    for path in &search_paths {
-        let lib_path = PathBuf::from(path);
-        let dylib = lib_path.join("libpbc.dylib");
-        let so = lib_path.join("libpbc.so");
-        let a = lib_path.join("libpbc.a");
-        if dylib.exists() || so.exists() || a.exists() {
-            println!("cargo:rustc-link-search={path}");
+    // Search well-known lib paths (already platform-filtered in DepPaths)
+    for path in &dep.lib_search {
+        let found = path.join("libpbc.dylib").exists()
+            || path.join("libpbc.so").exists()
+            || path.join("libpbc.a").exists()
+            || path.join("pbc.lib").exists();
+        if found {
+            println!("cargo:rustc-link-search={}", path.display());
             println!("cargo:rustc-link-lib=pbc");
-            println!("cargo:warning=Using system libpbc (found in {path})");
+            println!("cargo:warning=Using system libpbc (found in {})", path.display());
             return true;
         }
     }
@@ -177,8 +227,11 @@ fn try_system_pbc() -> bool {
     false
 }
 
-/// Build PBC from vendored source (vendor/pbc/).
-fn build_vendored_pbc() {
+// ---------------------------------------------------------------------------
+// Vendored PBC build
+// ---------------------------------------------------------------------------
+
+fn build_vendored_pbc(dep: &DepPaths) {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let pbc_dir = manifest_dir.join("../../vendor/pbc");
 
@@ -235,9 +288,9 @@ fn build_vendored_pbc() {
         .flag_if_supported("-ffast-math")
         .flag_if_supported("-fomit-frame-pointer");
 
-    // GMP include paths
-    build.include("/opt/homebrew/include");
-    build.include("/usr/local/include");
+    for p in &dep.include {
+        build.include(p);
+    }
 
     for src in &pbc_srcs {
         let path = pbc_dir.join(src);
