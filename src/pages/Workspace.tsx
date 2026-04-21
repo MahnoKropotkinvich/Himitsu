@@ -1,141 +1,178 @@
-import { useState, useRef, useCallback, useMemo } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type { RenderAction } from "../components/DecryptedViewer";
+import { listen } from "@tauri-apps/api/event";
+import { open, save } from "@tauri-apps/plugin-dialog";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 
-interface DecryptResult {
-  success: boolean;
-  size_bytes: number;
-  render: RenderAction;
-  message: string;
+interface FileInfo {
+  size: number;
+  name: string;
+  mime: string;
+  category: string;
+  preview_base64: string | null;
+  preview_data_url: string | null;
 }
 
-// --- Detect MIME from magic bytes (client-side, quick check) ---
-function detectMime(buf: Uint8Array): string {
-  if (buf.length < 4) return "application/octet-stream";
-  const h = (i: number) => buf[i];
-  // Images
-  if (h(0)===0x89 && h(1)===0x50 && h(2)===0x4e && h(3)===0x47) return "image/png";
-  if (h(0)===0xff && h(1)===0xd8) return "image/jpeg";
-  if (h(0)===0x47 && h(1)===0x49 && h(2)===0x46) return "image/gif";
-  if (h(0)===0x52 && h(1)===0x49 && h(2)===0x46 && h(3)===0x46 && buf.length>11 && h(8)===0x57 && h(9)===0x45 && h(10)===0x42 && h(11)===0x50) return "image/webp";
-  if (h(0)===0x00 && h(1)===0x00 && h(2)===0x01 && h(3)===0x00) return "image/x-icon";
-  // Video
-  if (buf.length>11 && h(4)===0x66 && h(5)===0x74 && h(6)===0x79 && h(7)===0x70) return "video/mp4";
-  if (h(0)===0x1a && h(1)===0x45 && h(2)===0xdf && h(3)===0xa3) return "video/webm";
-  // Audio
-  if (h(0)===0x49 && h(1)===0x44 && h(2)===0x33) return "audio/mpeg";
-  if (h(0)===0x4f && h(1)===0x67 && h(2)===0x67 && h(3)===0x53) return "audio/ogg";
-  if (h(0)===0x52 && h(1)===0x49 && h(2)===0x46 && h(3)===0x46) return "audio/wav";
-  if (h(0)===0x66 && h(1)===0x4c && h(2)===0x61 && h(3)===0x43) return "audio/flac";
-  // PDF
-  if (h(0)===0x25 && h(1)===0x50 && h(2)===0x44 && h(3)===0x46) return "application/pdf";
-  // Try UTF-8 text
-  try { new TextDecoder("utf-8", { fatal: true }).decode(buf.slice(0, 4096)); return "text/plain"; } catch {}
-  return "application/octet-stream";
+interface EncryptFileResult {
+  input_size: number;
+  output_size: number;
+  output_path: string;
 }
 
-function isRenderable(mime: string): boolean {
-  return (
-    mime.startsWith("image/") ||
-    mime.startsWith("video/") ||
-    mime.startsWith("audio/") ||
-    mime.startsWith("text/") ||
-    mime === "application/json" ||
-    mime === "application/pdf"
-  );
+interface DecryptFileResult {
+  size: number;
+  mime: string;
+  extension: string;
+  temp_path: string;
+  category: string;
+  preview_base64: string | null;
+  preview_data_url: string | null;
 }
 
-// --- Inline renderer for the plaintext panel ---
-function PlaintextPreview({ data, mime }: { data: Uint8Array; mime: string }) {
-  const url = useMemo(() => URL.createObjectURL(new Blob([data], { type: mime })), [data, mime]);
+// Unified preview data shape used by both panes
+interface PreviewData {
+  category: string;
+  preview_base64: string | null;
+  preview_data_url: string | null;
+}
 
-  if (mime.startsWith("image/"))
-    return <div className="inline-preview"><img src={url} alt="" /></div>;
-  if (mime.startsWith("video/"))
-    return <div className="inline-preview"><video controls src={url} /></div>;
-  if (mime.startsWith("audio/"))
-    return <div className="inline-preview"><audio controls src={url} /></div>;
-  if (mime === "application/pdf")
-    return <div className="inline-preview"><embed src={url} type="application/pdf" style={{ width: "100%", height: "100%" }} /></div>;
-  if (mime.startsWith("text/") || mime === "application/json") {
-    const text = new TextDecoder().decode(data);
+// --- Inline preview renderer ---
+function InlinePreview({ data }: { data: PreviewData }) {
+  if (!data.preview_data_url || !data.preview_base64) return null;
+
+  const cat = data.category;
+  if (cat === "Image")
+    return <div className="inline-preview"><img src={data.preview_data_url} alt="" /></div>;
+  if (cat === "Video")
+    return <div className="inline-preview"><video controls src={data.preview_data_url} /></div>;
+  if (cat === "Audio")
+    return <div className="inline-preview"><audio controls src={data.preview_data_url} /></div>;
+  if (cat === "Pdf")
+    return <PdfPreview base64={data.preview_base64} />;
+  if (cat === "Text") {
+    const text = atob(data.preview_base64);
     return <div className="inline-preview"><pre className="text-preview">{text.slice(0, 100000)}</pre></div>;
   }
-  // Should not reach here if isRenderable works, but just in case
-  return <BinaryInfo size={data.length} name="" />;
+  return null;
 }
 
-// --- Binary (non-renderable) file info + download ---
-function BinaryInfo({ size, name, onDownload }: { size: number; name: string; onDownload?: () => void }) {
+// PDF needs a blob: URL + iframe — embed/data: URIs are blocked by WebView
+function PdfPreview({ base64 }: { base64: string }) {
+  const blobUrl = useMemo(() => {
+    const raw = atob(base64);
+    const bytes = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+    const blob = new Blob([bytes], { type: "application/pdf" });
+    return URL.createObjectURL(blob);
+  }, [base64]);
+
+  useEffect(() => {
+    return () => URL.revokeObjectURL(blobUrl);
+  }, [blobUrl]);
+
   return (
-    <div className="binary-info">
-      <div className="binary-size">{formatBytes(size)}</div>
-      {name && <div className="binary-name">{name}</div>}
-      {onDownload && (
-        <button className="btn btn-outline btn-sm" style={{ marginTop: 8 }} onClick={(e) => { e.stopPropagation(); onDownload(); }}>
-          Save As...
-        </button>
-      )}
+    <div className="inline-preview">
+      <iframe src={blobUrl} style={{ width: "100%", height: "100%", border: "none" }} />
     </div>
   );
 }
 
+function hasPreview(data: PreviewData | null): boolean {
+  return !!data && !!data.preview_base64 && ["Image", "Video", "Audio", "Text", "Pdf"].includes(data.category);
+}
+
 export default function Workspace({ uskB64 }: { uskB64: string }) {
-  const [leftData, setLeftData] = useState<Uint8Array | null>(null);
+  // Left pane
+  const [leftPath, setLeftPath] = useState<string | null>(null);
   const [leftName, setLeftName] = useState("");
-  const [leftMime, setLeftMime] = useState("");
-  const [rightData, setRightData] = useState<Uint8Array | null>(null);
+  const [leftSize, setLeftSize] = useState(0);
+  const [leftPreview, setLeftPreview] = useState<PreviewData | null>(null);
+
+  // Right pane
+  const [rightPath, setRightPath] = useState<string | null>(null);
   const [rightName, setRightName] = useState("");
+  const [rightSize, setRightSize] = useState(0);
+
+  // Decrypt result (for Save button)
+  const [decryptResult, setDecryptResult] = useState<DecryptFileResult | null>(null);
+
   const [dialog, setDialog] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const [leftDrag, setLeftDrag] = useState(false);
-  const [rightDrag, setRightDrag] = useState(false);
 
-  const leftInput = useRef<HTMLInputElement>(null);
-  const rightInput = useRef<HTMLInputElement>(null);
+  // Helper: load file info + preview for left pane
+  const loadLeft = async (filePath: string) => {
+    try {
+      const info: FileInfo = await invoke("get_file_info", { path: filePath });
+      setLeftPath(filePath);
+      setLeftName(info.name);
+      setLeftSize(info.size);
+      setLeftPreview({
+        category: info.category,
+        preview_base64: info.preview_base64,
+        preview_data_url: info.preview_data_url,
+      });
+      setDecryptResult(null);
+    } catch (e) {
+      console.error("get_file_info failed:", e);
+    }
+  };
 
-  const loadFile = useCallback((file: File, side: "left" | "right") => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const bytes = new Uint8Array(reader.result as ArrayBuffer);
-      const mime = file.type || detectMime(bytes);
-      if (side === "left") {
-        setLeftData(bytes); setLeftName(file.name); setLeftMime(mime);
-      } else {
-        setRightData(bytes); setRightName(file.name);
+  const loadRight = async (filePath: string) => {
+    try {
+      const info: FileInfo = await invoke("get_file_info", { path: filePath });
+      setRightPath(filePath);
+      setRightName(info.name);
+      setRightSize(info.size);
+    } catch (e) {
+      console.error("get_file_info failed:", e);
+    }
+  };
+
+  // Listen for Tauri native drag-drop events
+  useEffect(() => {
+    const unlisten = listen<{ paths: string[]; position: { x: number; y: number } }>(
+      "tauri://drag-drop",
+      async (event) => {
+        const paths = event.payload.paths;
+        if (!paths || paths.length === 0) return;
+        const midX = window.innerWidth / 2;
+        if (event.payload.position.x < midX) {
+          await loadLeft(paths[0]);
+        } else {
+          await loadRight(paths[0]);
+        }
       }
-    };
-    reader.readAsArrayBuffer(file);
+    );
+    return () => { unlisten.then((fn) => fn()); };
   }, []);
 
-  const prevent = (e: React.DragEvent) => { e.preventDefault(); e.stopPropagation(); };
-  const onDragEnter = (e: React.DragEvent, s: "left"|"right") => { prevent(e); s==="left" ? setLeftDrag(true) : setRightDrag(true); };
-  const onDragOver = (e: React.DragEvent) => prevent(e);
-  const onDragLeave = (e: React.DragEvent, s: "left"|"right") => {
-    prevent(e);
-    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    const {clientX:x,clientY:y} = e;
-    if (x<=r.left||x>=r.right||y<=r.top||y>=r.bottom) { s==="left"?setLeftDrag(false):setRightDrag(false); }
-  };
-  const onDrop = (e: React.DragEvent, s: "left"|"right") => {
-    prevent(e);
-    s==="left"?setLeftDrag(false):setRightDrag(false);
-    const file = e.dataTransfer.files?.[0];
-    if (file) loadFile(file, s);
+  // --- File selection via dialog ---
+  const selectLeft = async () => {
+    const file = await open({ multiple: false, title: "Select plaintext file" });
+    if (file) await loadLeft(file);
   };
 
-  // --- Encrypt ---
+  const selectRight = async () => {
+    const file = await open({
+      multiple: false,
+      title: "Select ciphertext file",
+      filters: [{ name: "Himitsu Ciphertext", extensions: ["himitsu"] }, { name: "All files", extensions: ["*"] }],
+    });
+    if (file) await loadRight(file);
+  };
+
+  // --- Encrypt (auto-save to temp) ---
   const handleEncrypt = async () => {
-    if (!leftData) return;
+    if (!leftPath) return;
     setBusy(true);
     try {
-      const b64 = uint8ToBase64(leftData);
-      const ctB64: string = await invoke("encrypt_broadcast", {
-        plaintextBase64: b64,
+      const result: EncryptFileResult = await invoke("encrypt_file", {
+        inputPath: leftPath,
         policy: "Access::Broadcast",
       });
-      setRightData(base64ToUint8(ctB64));
+      setRightPath(result.output_path);
       setRightName((leftName || "file") + ".himitsu");
+      setRightSize(result.output_size);
     } catch (e: any) {
       setDialog(`Encryption failed:\n${e}`);
     } finally {
@@ -145,27 +182,25 @@ export default function Workspace({ uskB64 }: { uskB64: string }) {
 
   // --- Decrypt ---
   const handleDecrypt = async () => {
-    if (!rightData) return;
+    if (!rightPath) return;
     if (!uskB64) {
       setDialog("No decryption key loaded.\nGo to the Receiver tab and import a key first.");
       return;
     }
     setBusy(true);
     try {
-      const result: DecryptResult = await invoke("decrypt_content", {
-        ciphertextJsonBase64: uint8ToBase64(rightData),
-        userSecretKeyBase64: uskB64,
+      const result: DecryptFileResult = await invoke("decrypt_file", {
+        inputPath: rightPath,
       });
-      if (!result.success) {
-        setDialog(`Decryption failed:\n${result.message}`);
-        return;
-      }
-      if (result.render.kind === "Inline") {
-        const bytes = base64ToUint8(result.render.data_base64);
-        setLeftData(bytes);
-        setLeftMime(result.render.mime);
-        setLeftName("decrypted." + result.render.extension);
-      }
+      setDecryptResult(result);
+      setLeftName("decrypted." + result.extension);
+      setLeftSize(result.size);
+      setLeftPath(result.temp_path);
+      setLeftPreview({
+        category: result.category,
+        preview_base64: result.preview_base64,
+        preview_data_url: result.preview_data_url,
+      });
     } catch (e: any) {
       setDialog(`Decryption failed:\n${e}`);
     } finally {
@@ -173,18 +208,31 @@ export default function Workspace({ uskB64 }: { uskB64: string }) {
     }
   };
 
-  const clearLeft = () => { setLeftData(null); setLeftName(""); setLeftMime(""); };
-  const clearRight = () => { setRightData(null); setRightName(""); };
-
-  const downloadFile = (data: Uint8Array, name: string) => {
-    const blob = new Blob([data]);
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url; a.download = name; a.click();
-    URL.revokeObjectURL(url);
+  // --- Save temp file (works for both encrypted and decrypted) ---
+  const handleSave = async (tempPath: string, defaultName: string) => {
+    const dest = await save({
+      title: "Save file",
+      defaultPath: defaultName,
+    });
+    if (!dest) return;
+    try {
+      await invoke("save_temp_file", { tempPath, destPath: dest });
+    } catch (e: any) {
+      setDialog(`Save failed:\n${e}`);
+    }
   };
 
-  const leftRenderable = leftMime ? isRenderable(leftMime) : false;
+  // --- Reveal file in system file manager ---
+  const handleReveal = async (path: string) => {
+    try {
+      await revealItemInDir(path);
+    } catch (e) {
+      console.error("reveal failed:", e);
+    }
+  };
+
+  const clearLeft = () => { setLeftPath(null); setLeftName(""); setLeftSize(0); setLeftPreview(null); setDecryptResult(null); };
+  const clearRight = () => { setRightPath(null); setRightName(""); setRightSize(0); };
 
   return (
     <div className="workspace">
@@ -196,30 +244,31 @@ export default function Workspace({ uskB64 }: { uskB64: string }) {
             {leftName && <span className="panel-file-name">{leftName}</span>}
           </div>
           <div
-            className={`drop-zone ${leftDrag ? "drag-over" : ""} ${leftData ? "has-content" : ""}`}
-            onDragEnter={(e) => onDragEnter(e, "left")}
-            onDragOver={onDragOver}
-            onDragLeave={(e) => onDragLeave(e, "left")}
-            onDrop={(e) => onDrop(e, "left")}
-            onClick={() => !leftData && leftInput.current?.click()}
+            className={`drop-zone ${leftPath ? "has-content" : ""}`}
+            onClick={() => !leftPath && selectLeft()}
           >
-            {leftData ? (
+            {leftPath ? (
               <>
                 <div className="drop-zone-actions">
-                  <button className="btn btn-outline btn-sm" onClick={(e) => { e.stopPropagation(); downloadFile(leftData!, leftName || "plaintext.bin"); }}>Save</button>
+                  {decryptResult && (
+                    <button className="btn btn-outline btn-sm" onClick={(e) => { e.stopPropagation(); handleSave(decryptResult.temp_path, "decrypted." + decryptResult.extension); }}>Save</button>
+                  )}
+                  <button className="btn btn-outline btn-sm" onClick={(e) => { e.stopPropagation(); handleReveal(leftPath); }}>Reveal</button>
                   <button className="btn btn-outline btn-sm" onClick={(e) => { e.stopPropagation(); clearLeft(); }}>Clear</button>
                 </div>
-                {leftRenderable ? (
-                  <PlaintextPreview data={leftData} mime={leftMime} />
+                {hasPreview(leftPreview) ? (
+                  <InlinePreview data={leftPreview!} />
                 ) : (
-                  <BinaryInfo size={leftData.length} name={leftName} />
+                  <div className="binary-info">
+                    <div className="binary-size">{formatBytes(leftSize)}</div>
+                    <div className="binary-name">{leftName}</div>
+                  </div>
                 )}
               </>
             ) : (
               <div className="drop-hint">Drop file here<br/>or click to select</div>
             )}
           </div>
-          <input ref={leftInput} type="file" hidden onChange={(e) => { if (e.target.files?.[0]) loadFile(e.target.files[0], "left"); e.target.value=""; }} />
         </div>
 
         {/* RIGHT: Ciphertext */}
@@ -229,35 +278,34 @@ export default function Workspace({ uskB64 }: { uskB64: string }) {
             {rightName && <span className="panel-file-name">{rightName}</span>}
           </div>
           <div
-            className={`drop-zone ${rightDrag ? "drag-over" : ""} ${rightData ? "has-content" : ""}`}
-            onDragEnter={(e) => onDragEnter(e, "right")}
-            onDragOver={onDragOver}
-            onDragLeave={(e) => onDragLeave(e, "right")}
-            onDrop={(e) => onDrop(e, "right")}
-            onClick={() => !rightData && rightInput.current?.click()}
+            className={`drop-zone ${rightPath ? "has-content" : ""}`}
+            onClick={() => !rightPath && selectRight()}
           >
-            {rightData ? (
+            {rightPath ? (
               <>
                 <div className="drop-zone-actions">
-                  <button className="btn btn-outline btn-sm" onClick={(e) => { e.stopPropagation(); downloadFile(rightData!, rightName || "encrypted.himitsu"); }}>Save</button>
+                  <button className="btn btn-outline btn-sm" onClick={(e) => { e.stopPropagation(); handleSave(rightPath, rightName); }}>Save</button>
+                  <button className="btn btn-outline btn-sm" onClick={(e) => { e.stopPropagation(); handleReveal(rightPath); }}>Reveal</button>
                   <button className="btn btn-outline btn-sm" onClick={(e) => { e.stopPropagation(); clearRight(); }}>Clear</button>
                 </div>
-                <BinaryInfo size={rightData.length} name={rightName} />
+                <div className="binary-info">
+                  <div className="binary-size">{rightSize ? formatBytes(rightSize) : ""}</div>
+                  <div className="binary-name">{rightName}</div>
+                </div>
               </>
             ) : (
               <div className="drop-hint">Drop ciphertext here<br/>or click to select</div>
             )}
           </div>
-          <input ref={rightInput} type="file" hidden onChange={(e) => { if (e.target.files?.[0]) loadFile(e.target.files[0], "right"); e.target.value=""; }} />
         </div>
       </div>
 
       {/* Action bar */}
       <div className="workspace-actions">
-        <button className="btn btn-primary" disabled={!leftData || busy} onClick={handleEncrypt}>
+        <button className="btn btn-primary" disabled={!leftPath || busy} onClick={handleEncrypt}>
           {busy ? "..." : "Encrypt \u00BB"}
         </button>
-        <button className="btn btn-primary" disabled={!rightData || busy} onClick={handleDecrypt}>
+        <button className="btn btn-primary" disabled={!rightPath || busy} onClick={handleDecrypt}>
           {busy ? "..." : "\u00AB Decrypt"}
         </button>
       </div>
@@ -281,11 +329,6 @@ export default function Workspace({ uskB64 }: { uskB64: string }) {
 function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1048576) return `${(n / 1024).toFixed(1)} KB`;
-  return `${(n / 1048576).toFixed(1)} MB`;
-}
-function uint8ToBase64(b: Uint8Array): string {
-  let s=""; for(let i=0;i<b.length;i++) s+=String.fromCharCode(b[i]); return btoa(s);
-}
-function base64ToUint8(s: string): Uint8Array {
-  const b=atob(s); const a=new Uint8Array(b.length); for(let i=0;i<b.length;i++) a[i]=b.charCodeAt(i); return a;
+  if (n < 1073741824) return `${(n / 1048576).toFixed(1)} MB`;
+  return `${(n / 1073741824).toFixed(2)} GB`;
 }

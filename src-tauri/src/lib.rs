@@ -39,6 +39,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             commands::broadcast::ensure_initialized,
@@ -59,6 +60,10 @@ pub fn run() {
             commands::decrypt::set_active_receiver_key,
             commands::decrypt::delete_receiver_key,
             commands::decrypt::load_active_receiver_key,
+            commands::file_crypto::encrypt_file,
+            commands::file_crypto::decrypt_file,
+            commands::file_crypto::save_temp_file,
+            commands::file_crypto::get_file_info,
             commands::ledger::get_ledger_entries,
             commands::ledger::search_ledger,
         ])

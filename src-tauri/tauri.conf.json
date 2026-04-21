@@ -15,7 +15,7 @@
         "title": "Himitsu",
         "width": 960,
         "height": 640,
-        "dragDropEnabled": false
+        "dragDropEnabled": true
       }
     ],
     "security": {
