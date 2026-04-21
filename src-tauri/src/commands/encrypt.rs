@@ -20,9 +20,10 @@ pub fn encrypt_file(
         .map_err(|e| format!("Failed to read input file: {e}"))?;
     let input_size = plaintext.len() as u64;
 
-    let db = state.db.lock().unwrap();
-    let recipients = super::subscribers::get_active_recipient_indices(&db)?;
-    drop(db);
+    let recipients = {
+        let db = state.db.lock().unwrap();
+        super::subscribers::get_active_recipient_indices(&db)?
+    };
 
     if recipients.is_empty() {
         return Err("No active subscribers to encrypt for".into());
@@ -95,9 +96,10 @@ pub fn encrypt_folder(
     }
     let input_size = tar_buf.len() as u64;
 
-    let db = state.db.lock().unwrap();
-    let recipients = super::subscribers::get_active_recipient_indices(&db)?;
-    drop(db);
+    let recipients = {
+        let db = state.db.lock().unwrap();
+        super::subscribers::get_active_recipient_indices(&db)?
+    };
 
     if recipients.is_empty() {
         return Err("No active subscribers to encrypt for".into());

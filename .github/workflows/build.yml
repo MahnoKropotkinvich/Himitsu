@@ -61,6 +61,7 @@ jobs:
         with:
           workspaces: src-tauri -> target
           key: ${{ matrix.target }}
+          cache-on-failure: true
 
       # ── Linux system deps ──────────────────────────────────────
       - name: Linux system dependencies
@@ -97,7 +98,7 @@ jobs:
         id: vcpkg-cache
         uses: actions/cache/restore@v4
         with:
-          path: ${{ env.VCPKG_INSTALLATION_ROOT }}/installed
+          path: ${{ env.VCPKG_ROOT }}/installed
           key: vcpkg-x64-windows-gmp-v1
 
       - name: Install GMP via vcpkg (Windows)
@@ -108,19 +109,15 @@ jobs:
         if: runner.os == 'Windows' && steps.vcpkg-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
-          path: ${{ env.VCPKG_INSTALLATION_ROOT }}/installed
+          path: ${{ env.VCPKG_ROOT }}/installed
           key: vcpkg-x64-windows-gmp-v1
 
       - name: Set vcpkg env (Windows)
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          echo "GMP_LIB_DIR=$VCPKG_INSTALLATION_ROOT/installed/x64-windows-static-md/lib" >> $GITHUB_ENV
-          echo "C_INCLUDE_PATH=$VCPKG_INSTALLATION_ROOT/installed/x64-windows-static-md/include" >> $GITHUB_ENV
-
-      # ── Git submodules (PBC + PBC_BKEM) ───────────────────────────
-      - name: Update submodules
-        run: git submodule update --init --recursive
+          echo "GMP_LIB_DIR=$VCPKG_ROOT/installed/x64-windows-static-md/lib" >> $GITHUB_ENV
+          echo "INCLUDE=$VCPKG_ROOT/installed/x64-windows-static-md/include" >> $GITHUB_ENV
 
       # ── Build ─────────────────────────────────────────────────
       - name: Build Tauri app
