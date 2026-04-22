@@ -1,51 +1,15 @@
-//! Key distribution and receiver key management.
+//! Receiver-side key management: import, list, activate, delete.
 
 use tauri::State;
 
 use crate::AppState;
 use crate::crypto::gpg;
 use crate::storage::models::{ReceiverKey, ReceiverKeyInfo, UserKeyRecord};
-use crate::storage::schema::{CF_ENCRYPTED_KEYS, CF_RECEIVER};
+use crate::storage::schema::CF_RECEIVER;
 
-// ---------------------------------------------------------------------------
-// Distributor-side: key distribution
-// ---------------------------------------------------------------------------
-
-/// Return the GPG-encrypted user key blob for re-download.
+/// Import a GPG-encrypted receiver key (contains BGW private key + index + PK).
 #[tauri::command]
-pub fn download_user_key(
-    user_id: String,
-    state: State<'_, AppState>,
-) -> std::result::Result<Vec<u8>, String> {
-    let db = state.db.lock().unwrap();
-    db.get_cf(CF_ENCRYPTED_KEYS, user_id.as_bytes())
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "Encrypted key not found for this user".to_string())
-}
-
-/// Export a user's GPG-encrypted key to a file on disk.
-#[tauri::command]
-pub fn export_user_key(
-    user_id: String,
-    dest_path: String,
-    state: State<'_, AppState>,
-) -> std::result::Result<(), String> {
-    let db = state.db.lock().unwrap();
-    let blob = db.get_cf(CF_ENCRYPTED_KEYS, user_id.as_bytes())
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "Encrypted key not found".to_string())?;
-    std::fs::write(&dest_path, &blob)
-        .map_err(|e| format!("Failed to write key file: {e}"))?;
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Receiver-side: key import and management
-// ---------------------------------------------------------------------------
-
-/// Import a GPG-encrypted receiver key (contains BGW private key + index).
-#[tauri::command]
-pub fn import_receiver_key(
+pub fn import_key(
     encrypted_bytes: Vec<u8>,
     armored_secret_key: String,
     passphrase: String,
@@ -71,6 +35,7 @@ pub fn import_receiver_key(
         created_at: chrono::Utc::now(),
         bgw_index: bundle.bgw_index,
         usk_bytes: bundle.key_data,
+        pk_bytes: bundle.pk_data,
     };
 
     let db = state.db.lock().unwrap();
@@ -83,7 +48,7 @@ pub fn import_receiver_key(
 
 /// List all saved receiver keys.
 #[tauri::command]
-pub fn list_receiver_keys(
+pub fn list_keys(
     state: State<'_, AppState>,
 ) -> std::result::Result<Vec<ReceiverKeyInfo>, String> {
     let db = state.db.lock().unwrap();
@@ -112,7 +77,7 @@ pub fn list_receiver_keys(
 
 /// Set active receiver key.
 #[tauri::command]
-pub fn set_active_receiver_key(
+pub fn set_active_key(
     key_id: String,
     state: State<'_, AppState>,
 ) -> std::result::Result<(), String> {
@@ -124,7 +89,7 @@ pub fn set_active_receiver_key(
 
 /// Delete a receiver key.
 #[tauri::command]
-pub fn delete_receiver_key(
+pub fn delete_key(
     key_id: String,
     state: State<'_, AppState>,
 ) -> std::result::Result<(), String> {
@@ -142,7 +107,7 @@ pub fn delete_receiver_key(
 
 /// Load active receiver key's BGW index (for frontend status).
 #[tauri::command]
-pub fn load_active_receiver_key(
+pub fn get_active_key(
     state: State<'_, AppState>,
 ) -> std::result::Result<String, String> {
     let db = state.db.lock().unwrap();
@@ -159,8 +124,8 @@ pub fn load_active_receiver_key(
     }
 }
 
-/// Helper: load active receiver key from DB.
-pub fn load_active_rk(db: &crate::storage::db::Database) -> std::result::Result<ReceiverKey, String> {
+/// Helper: load active receiver key from DB (used by decrypt commands).
+pub fn load_active(db: &crate::storage::db::Database) -> std::result::Result<ReceiverKey, String> {
     let active_id = db.get_cf(CF_RECEIVER, b"__active__")
         .map_err(|e| e.to_string())?
         .ok_or("No decryption key loaded. Go to the Receiver tab and import a key first.")?;

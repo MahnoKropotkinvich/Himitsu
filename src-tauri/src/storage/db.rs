@@ -82,6 +82,22 @@ impl Database {
         Ok(results)
     }
 
+    /// Iterate over entries whose key starts with `prefix`.
+    pub fn prefix_iter_cf(&self, cf_name: &str, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let cf = self.inner.cf_handle(cf_name)
+            .ok_or_else(|| HimitsuError::Database(format!("CF {} not found", cf_name)))?;
+        let iter = self.inner.prefix_iterator_cf(&cf, prefix);
+        let mut results = Vec::new();
+        for item in iter {
+            let (k, v) = item.map_err(|e| HimitsuError::Database(e.to_string()))?;
+            if !k.starts_with(prefix) {
+                break;
+            }
+            results.push((k.to_vec(), v.to_vec()));
+        }
+        Ok(results)
+    }
+
     /// Count entries in a column family (for debugging).
     pub fn count_cf(&self, cf_name: &str) -> Result<usize> {
         Ok(self.iter_cf(cf_name)?.len())

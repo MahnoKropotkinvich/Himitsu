@@ -5,6 +5,7 @@ pub mod storage;
 pub mod util;
 
 use storage::db::Database;
+use std::collections::HashMap;
 use std::sync::Mutex;
 use tauri::Manager;
 
@@ -12,8 +13,11 @@ use tauri::Manager;
 pub struct AppState {
     pub db: Mutex<Database>,
     pub temp_files: Mutex<Vec<std::path::PathBuf>>,
-    /// Live BGW broadcast encryption system (kept in memory).
-    pub bgw: Mutex<Option<crypto::bgw::BgwSystem>>,
+    /// Live BGW broadcast systems, keyed by namespace ID.
+    /// Loaded on demand from RocksDB.
+    pub bgw: Mutex<HashMap<String, crypto::bgw::BgwSystem>>,
+    /// Currently active namespace ID for the distributor UI.
+    pub active_namespace: Mutex<Option<String>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -36,7 +40,8 @@ pub fn run() {
     let state = AppState {
         db: Mutex::new(db),
         temp_files: Mutex::new(Vec::new()),
-        bgw: Mutex::new(None),
+        bgw: Mutex::new(HashMap::new()),
+        active_namespace: Mutex::new(None),
     };
 
     tauri::Builder::default()
@@ -46,20 +51,27 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             // System
             commands::system::ensure_initialized,
-            // Subscribers
-            commands::subscribers::import_and_assign,
-            commands::subscribers::import_gpg_public_key,
-            commands::subscribers::list_gpg_keys,
-            commands::subscribers::set_user_revoked,
-            commands::subscribers::delete_user,
-            // Keys
-            commands::keys::download_user_key,
-            commands::keys::export_user_key,
-            commands::keys::import_receiver_key,
-            commands::keys::list_receiver_keys,
-            commands::keys::set_active_receiver_key,
-            commands::keys::delete_receiver_key,
-            commands::keys::load_active_receiver_key,
+            // Namespaces
+            commands::namespace::create_namespace,
+            commands::namespace::list_namespaces,
+            commands::namespace::get_active_namespace,
+            commands::namespace::set_active_namespace,
+            // Subscribers (distributor-side)
+            commands::subscribers::add_subscriber,
+            commands::subscribers::import_subscriber_key,
+            commands::subscribers::list_subscribers,
+            commands::subscribers::set_subscriber_revoked,
+            commands::subscribers::delete_subscriber,
+            commands::subscribers::download_subscriber_key,
+            commands::subscribers::export_subscriber_key,
+            commands::subscribers::get_ledger_entries,
+            commands::subscribers::search_ledger,
+            // Receiver
+            commands::receiver::import_key,
+            commands::receiver::list_keys,
+            commands::receiver::set_active_key,
+            commands::receiver::delete_key,
+            commands::receiver::get_active_key,
             // Encrypt
             commands::encrypt::encrypt_file,
             commands::encrypt::encrypt_folder,
@@ -72,8 +84,8 @@ pub fn run() {
             commands::files::get_file_info,
             commands::files::save_temp_file,
             // Ledger
-            commands::ledger::get_ledger_entries,
-            commands::ledger::search_ledger,
+            commands::subscribers::get_ledger_entries,
+            commands::subscribers::search_ledger,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
