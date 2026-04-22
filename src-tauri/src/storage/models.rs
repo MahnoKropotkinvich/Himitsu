@@ -157,6 +157,8 @@ pub struct DecryptFileResult {
     pub category: String,
     pub preview_base64: Option<String>,
     pub preview_data_url: Option<String>,
+    /// Original filename from encryption metadata.
+    pub original_name: Option<String>,
 }
 
 /// Receiver key info for listing in the frontend.

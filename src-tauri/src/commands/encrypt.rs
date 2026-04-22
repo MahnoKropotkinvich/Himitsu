@@ -1,4 +1,4 @@
-//! File and folder encryption commands.
+//! File, folder, and in-memory content encryption commands.
 
 use tauri::State;
 
@@ -29,20 +29,20 @@ pub fn encrypt_file(
         return Err("No active subscribers to encrypt for".into());
     }
 
-    let bgw_guard = state.bgw.lock().unwrap();
-    let bgw_sys = bgw_guard.as_ref().ok_or("BGW system not initialized")?;
-
-    let broadcast_ct = bgw::encrypt(bgw_sys, &recipients, &plaintext)
-        .map_err(|e| e.to_string())?;
-
     let input_name = std::path::Path::new(&input_path)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "encrypted".into());
 
+    let bgw_guard = state.bgw.lock().unwrap();
+    let bgw_sys = bgw_guard.as_ref().ok_or("BGW system not initialized")?;
+
+    let broadcast_ct = bgw::encrypt(bgw_sys, &recipients, &plaintext, Some(input_name.clone()))
+        .map_err(|e| e.to_string())?;
+
     let dir = std::env::temp_dir().join("himitsu");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let output_path = dir.join(format!("{}.himitsu", input_name));
+    let output_path = dir.join(format!("{}.himitsu", uuid::Uuid::new_v4()));
 
     let file = std::fs::File::create(&output_path)
         .map_err(|e| format!("Failed to create output file: {e}"))?;
@@ -105,19 +105,19 @@ pub fn encrypt_folder(
         return Err("No active subscribers to encrypt for".into());
     }
 
-    let bgw_guard = state.bgw.lock().unwrap();
-    let bgw_sys = bgw_guard.as_ref().ok_or("BGW system not initialized")?;
-
-    let broadcast_ct = bgw::encrypt(bgw_sys, &recipients, &tar_buf)
-        .map_err(|e| e.to_string())?;
-
     let folder_name = src.file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "folder".into());
 
+    let bgw_guard = state.bgw.lock().unwrap();
+    let bgw_sys = bgw_guard.as_ref().ok_or("BGW system not initialized")?;
+
+    let broadcast_ct = bgw::encrypt(bgw_sys, &recipients, &tar_buf, Some(folder_name.clone()))
+        .map_err(|e| e.to_string())?;
+
     let dir = std::env::temp_dir().join("himitsu");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let output_path = dir.join(format!("{}.himitsu", folder_name));
+    let output_path = dir.join(format!("{}.himitsu", uuid::Uuid::new_v4()));
 
     let file = std::fs::File::create(&output_path)
         .map_err(|e| format!("Failed to create output file: {e}"))?;
@@ -137,6 +137,64 @@ pub fn encrypt_folder(
         input_size, output_size,
         "Folder encrypted"
     );
+
+    Ok(EncryptFileResult {
+        input_size,
+        output_size,
+        output_path: output_path.display().to_string(),
+    })
+}
+
+/// Encrypt in-memory content (e.g. browser-dragged images).
+///
+/// Accepts base64-encoded plaintext + original filename, encrypts for all
+/// non-revoked users, writes the ciphertext to a temp file.
+#[tauri::command]
+pub fn encrypt_content(
+    data_base64: String,
+    filename: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<EncryptFileResult, String> {
+    use base64::Engine;
+    use std::io::BufWriter;
+
+    let plaintext = base64::engine::general_purpose::STANDARD
+        .decode(&data_base64)
+        .map_err(|e| format!("Invalid base64: {e}"))?;
+    let input_size = plaintext.len() as u64;
+
+    let recipients = {
+        let db = state.db.lock().unwrap();
+        super::subscribers::get_active_recipient_indices(&db)?
+    };
+
+    if recipients.is_empty() {
+        return Err("No active subscribers to encrypt for".into());
+    }
+
+    let bgw_guard = state.bgw.lock().unwrap();
+    let bgw_sys = bgw_guard.as_ref().ok_or("BGW system not initialized")?;
+
+    let broadcast_ct = bgw::encrypt(bgw_sys, &recipients, &plaintext, Some(filename.clone()))
+        .map_err(|e| e.to_string())?;
+
+    let dir = std::env::temp_dir().join("himitsu");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let output_path = dir.join(format!("{}.himitsu", uuid::Uuid::new_v4()));
+
+    let file = std::fs::File::create(&output_path)
+        .map_err(|e| format!("Failed to create output file: {e}"))?;
+    let writer = BufWriter::new(file);
+    bincode::serialize_into(writer, &broadcast_ct)
+        .map_err(|e| format!("Failed to write ciphertext: {e}"))?;
+
+    let output_size = std::fs::metadata(&output_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    state.temp_files.lock().unwrap().push(output_path.clone());
+
+    tracing::info!(filename = %filename, input_size, output_size, "Content encrypted");
 
     Ok(EncryptFileResult {
         input_size,

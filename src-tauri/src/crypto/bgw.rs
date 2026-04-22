@@ -34,6 +34,9 @@ pub struct BroadcastCiphertext {
     pub chunks: Vec<Vec<u8>>,
     pub chunk_size: usize,
     pub compressed: bool,
+    /// Original filename (preserved across encrypt/decrypt).
+    #[serde(default)]
+    pub filename: Option<String>,
 }
 
 /// Live BGW system handle — NOT serializable.
@@ -355,6 +358,7 @@ pub fn encrypt(
     bgw: &BgwSystem,
     recipients: &[u32],
     plaintext: &[u8],
+    filename: Option<String>,
 ) -> Result<BroadcastCiphertext> {
     use aes_gcm::{Aes256Gcm, Key, Nonce};
     use aes_gcm::aead::{Aead, KeyInit};
@@ -399,6 +403,7 @@ pub fn encrypt(
         chunks,
         chunk_size: CHUNK_SIZE,
         compressed: true,
+        filename,
     })
 }
 

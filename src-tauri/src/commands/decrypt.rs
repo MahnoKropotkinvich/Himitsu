@@ -69,52 +69,6 @@ pub fn decrypt_content(
     })
 }
 
-/// Decrypt and open with system default application.
-#[tauri::command]
-pub fn decrypt_and_open(
-    ciphertext_base64: String,
-    state: State<'_, AppState>,
-) -> std::result::Result<DecryptResult, String> {
-    use base64::Engine;
-
-    let rk = {
-        let db = state.db.lock().unwrap();
-        super::keys::load_active_rk(&db)?
-    };
-
-    let ct_bytes = base64::engine::general_purpose::STANDARD
-        .decode(&ciphertext_base64)
-        .map_err(|e| format!("Invalid ciphertext base64: {e}"))?;
-    let broadcast_ct: BroadcastCiphertext =
-        bincode::deserialize(&ct_bytes).map_err(|e| format!("Invalid ciphertext: {e}"))?;
-
-    let bgw_guard = state.bgw.lock().unwrap();
-    let bgw_sys = bgw_guard.as_ref().ok_or("BGW system not initialized")?;
-
-    let plaintext = bgw::decrypt(bgw_sys, rk.bgw_index, &rk.usk_bytes, &broadcast_ct)
-        .map_err(|e| e.to_string())?;
-
-    let ft = file_type::detect_file_type(&plaintext);
-    let ext = ft.as_ref().map(|f| f.extension.as_str()).unwrap_or("bin");
-    let mime = ft.as_ref().map(|f| f.mime.clone()).unwrap_or_else(|| "application/octet-stream".into());
-
-    let path = file_type::write_temp_and_open(&plaintext, ext).map_err(|e| e.to_string())?;
-    state.temp_files.lock().unwrap().push(path.clone());
-
-    let render = crate::storage::models::RenderAction::External {
-        mime,
-        extension: ext.to_string(),
-        temp_path: path.display().to_string(),
-    };
-
-    Ok(DecryptResult {
-        success: true,
-        size_bytes: plaintext.len(),
-        render,
-        message: "Opened with system default application".into(),
-    })
-}
-
 /// Decrypt a file on disk.
 ///
 /// For files < 10 MiB, also returns base64 data for inline preview.
@@ -124,17 +78,21 @@ pub fn decrypt_file(
     state: State<'_, AppState>,
 ) -> std::result::Result<DecryptFileResult, String> {
     use base64::Engine;
+    use std::io::BufReader;
 
     let rk = {
         let db = state.db.lock().unwrap();
         super::keys::load_active_rk(&db)?
     };
 
-    let ct_bytes = std::fs::read(&input_path)
-        .map_err(|e| format!("Failed to read ciphertext file: {e}"))?;
+    let file = std::fs::File::open(&input_path)
+        .map_err(|e| format!("Failed to open ciphertext file: {e}"))?;
+    let reader = BufReader::new(file);
     let broadcast_ct: BroadcastCiphertext =
-        bincode::deserialize(&ct_bytes)
+        bincode::deserialize_from(reader)
             .map_err(|e| format!("Invalid ciphertext file: {e}"))?;
+
+    let original_name = broadcast_ct.filename.clone();
 
     let bgw_guard = state.bgw.lock().unwrap();
     let bgw_sys = bgw_guard.as_ref().ok_or("BGW system not initialized")?;
@@ -151,13 +109,29 @@ pub fn decrypt_file(
     if is_tar {
         let dir = std::env::temp_dir().join("himitsu");
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let out_dir = dir.join(format!("dir_{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
 
+        // Unpack directly into himitsu temp dir — tar already contains the
+        // top-level directory, no need to wrap in another dir_<uuid>.
         let cursor = std::io::Cursor::new(&plaintext);
         let mut archive = tar::Archive::new(cursor);
-        archive.unpack(&out_dir)
+        archive.unpack(&dir)
             .map_err(|e| format!("Failed to untar: {e}"))?;
+
+        // Find the top-level directory name from tar entries
+        let cursor2 = std::io::Cursor::new(&plaintext);
+        let mut archive2 = tar::Archive::new(cursor2);
+        let top_dir = archive2.entries()
+            .ok()
+            .and_then(|mut entries| entries.next())
+            .and_then(|e| e.ok())
+            .and_then(|e| {
+                let p = e.path().ok()?;
+                let first = p.components().next()?;
+                Some(first.as_os_str().to_string_lossy().to_string())
+            })
+            .unwrap_or_else(|| format!("dir_{}", uuid::Uuid::new_v4()));
+
+        let out_dir = dir.join(&top_dir);
 
         tracing::info!(
             input_path = %input_path,
@@ -174,6 +148,7 @@ pub fn decrypt_file(
             category: "Folder".into(),
             preview_base64: None,
             preview_data_url: None,
+            original_name: original_name.clone(),
         });
     }
 
@@ -193,9 +168,13 @@ pub fn decrypt_file(
         }
     };
 
+    // Use original filename for temp file if available
     let dir = std::env::temp_dir().join("himitsu");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let filename = format!("dec_{}.{}", uuid::Uuid::new_v4(), extension);
+    let filename = match &original_name {
+        Some(name) => format!("{}_{}", uuid::Uuid::new_v4(), name),
+        None => format!("dec_{}.{}", uuid::Uuid::new_v4(), extension),
+    };
     let temp_path = dir.join(&filename);
     std::fs::write(&temp_path, &plaintext)
         .map_err(|e| format!("Failed to write temp file: {e}"))?;
@@ -226,6 +205,7 @@ pub fn decrypt_file(
         temp_path: temp_path.display().to_string(),
         category,
         preview_base64, preview_data_url,
+        original_name,
     })
 }
 
@@ -235,16 +215,21 @@ pub fn decrypt_to_folder(
     input_path: String,
     state: State<'_, AppState>,
 ) -> std::result::Result<DecryptFileResult, String> {
+    use std::io::BufReader;
+
     let rk = {
         let db = state.db.lock().unwrap();
         super::keys::load_active_rk(&db)?
     };
 
-    let ct_bytes = std::fs::read(&input_path)
-        .map_err(|e| format!("Failed to read ciphertext file: {e}"))?;
+    let file = std::fs::File::open(&input_path)
+        .map_err(|e| format!("Failed to open ciphertext file: {e}"))?;
+    let reader = BufReader::new(file);
     let broadcast_ct: BroadcastCiphertext =
-        bincode::deserialize(&ct_bytes)
+        bincode::deserialize_from(reader)
             .map_err(|e| format!("Invalid ciphertext file: {e}"))?;
+
+    let original_name = broadcast_ct.filename.clone();
 
     let bgw_guard = state.bgw.lock().unwrap();
     let bgw_sys = bgw_guard.as_ref().ok_or("BGW system not initialized")?;
@@ -257,13 +242,27 @@ pub fn decrypt_to_folder(
 
     let dir = std::env::temp_dir().join("himitsu");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let out_dir = dir.join(format!("dir_{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
 
     let cursor = std::io::Cursor::new(&plaintext);
     let mut archive = tar::Archive::new(cursor);
-    archive.unpack(&out_dir)
+    archive.unpack(&dir)
         .map_err(|e| format!("Failed to untar: {e}"))?;
+
+    // Find the top-level directory name from tar entries
+    let cursor2 = std::io::Cursor::new(&plaintext);
+    let mut archive2 = tar::Archive::new(cursor2);
+    let top_dir = archive2.entries()
+        .ok()
+        .and_then(|mut entries| entries.next())
+        .and_then(|e| e.ok())
+        .and_then(|e| {
+            let p = e.path().ok()?;
+            let first = p.components().next()?;
+            Some(first.as_os_str().to_string_lossy().to_string())
+        })
+        .unwrap_or_else(|| format!("dir_{}", uuid::Uuid::new_v4()));
+
+    let out_dir = dir.join(&top_dir);
 
     tracing::info!(
         input_path = %input_path,
@@ -280,5 +279,6 @@ pub fn decrypt_to_folder(
         category: "Folder".into(),
         preview_base64: None,
         preview_data_url: None,
+        original_name,
     })
 }

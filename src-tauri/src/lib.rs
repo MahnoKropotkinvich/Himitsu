@@ -63,9 +63,9 @@ pub fn run() {
             // Encrypt
             commands::encrypt::encrypt_file,
             commands::encrypt::encrypt_folder,
+            commands::encrypt::encrypt_content,
             // Decrypt
             commands::decrypt::decrypt_content,
-            commands::decrypt::decrypt_and_open,
             commands::decrypt::decrypt_file,
             commands::decrypt::decrypt_to_folder,
             // Files
