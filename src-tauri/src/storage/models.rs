@@ -7,6 +7,58 @@ use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
 
 // ---------------------------------------------------------------------------
+// Namespace models
+// ---------------------------------------------------------------------------
+
+/// A key distribution namespace. Each owns a separate BGW system (N=1000).
+///
+/// All 1000 slots are pre-generated at creation. Encryption always targets
+/// all 1000 slots, so any user assigned later can decrypt earlier content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Namespace {
+    pub id: String,
+    pub name: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// State of a key slot within a namespace.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum SlotState {
+    /// Can be assigned to a new user.
+    Available,
+    /// Currently assigned to a user.
+    Assigned,
+    /// Temporarily frozen — user's access suspended, slot not reassignable.
+    Revoked,
+    /// Permanently destroyed — slot can never be reused.
+    Deleted,
+}
+
+/// A single key slot within a namespace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeySlot {
+    pub namespace_id: String,
+    pub index: u32,
+    pub state: SlotState,
+    /// User ID if assigned/revoked (None if available/deleted).
+    pub user_id: Option<String>,
+    pub assigned_at: Option<DateTime<Utc>>,
+}
+
+/// Summary info for a namespace, returned to the frontend.
+#[derive(Debug, Clone, Serialize)]
+pub struct NamespaceInfo {
+    pub id: String,
+    pub name: String,
+    pub created_at: String,
+    pub total_slots: u32,
+    pub available: u32,
+    pub assigned: u32,
+    pub revoked: u32,
+    pub deleted: u32,
+}
+
+// ---------------------------------------------------------------------------
 // Subscriber / distributor models
 // ---------------------------------------------------------------------------
 
@@ -21,6 +73,8 @@ pub struct Applicant {
     pub revoked: bool,
     /// BGW user slot index (0..N-1).
     pub bgw_index: u32,
+    /// Namespace this subscriber belongs to.
+    pub namespace_id: String,
 }
 
 /// BGW user key record (bundled with index for GPG-encrypted distribution).
@@ -30,6 +84,9 @@ pub struct UserKeyRecord {
     pub bgw_index: u32,
     /// Raw BGW private key bytes (PBC element serialized).
     pub key_data: Vec<u8>,
+    /// Distributor's BGW public key (g, g_i, v_i serialized).
+    /// Required by the receiver for decapsulation.
+    pub pk_data: Vec<u8>,
 }
 
 /// A saved receiver decryption key (BGW private key + user index).
@@ -42,6 +99,8 @@ pub struct ReceiverKey {
     pub bgw_index: u32,
     /// Raw BGW private key bytes.
     pub usk_bytes: Vec<u8>,
+    /// Distributor's BGW public key bytes.
+    pub pk_bytes: Vec<u8>,
 }
 
 /// Fingerprint vector assigned to a user for traitor tracing.

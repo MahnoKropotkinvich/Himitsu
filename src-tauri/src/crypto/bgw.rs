@@ -197,6 +197,42 @@ impl BgwSystem {
         unsafe { (*self.gps).N as usize }
     }
 
+    /// Export the system's public key (g, g_i, v_i) as bytes.
+    ///
+    /// This is bundled with each user's private key so receivers can
+    /// decapsulate without needing the distributor's full system.
+    ///
+    /// Format: [A:u32][B:u32][g...][num_gi:u32]([len:u32][bytes...])*
+    ///         [num_vi:u32]([len:u32][bytes...])*
+    pub fn export_public_key(&self) -> Result<Vec<u8>> {
+        unsafe {
+            let a = (*self.gps).A as u32;
+            let b = (*self.gps).B as u32;
+            let pk = &*(*self.sys).PK;
+
+            let mut out = Vec::new();
+            out.extend_from_slice(&a.to_le_bytes());
+            out.extend_from_slice(&b.to_le_bytes());
+
+            serialize_element(&mut out, pk.g.as_ptr() as *mut _);
+
+            let num_gi = (2 * b) as usize;
+            out.extend_from_slice(&(num_gi as u32).to_le_bytes());
+            for i in 0..num_gi {
+                let elem = pk.g_i.offset(i as isize) as *mut pbc_bkem_sys::element_s;
+                serialize_element(&mut out, elem);
+            }
+
+            out.extend_from_slice(&a.to_le_bytes());
+            for i in 0..a as usize {
+                let elem = pk.v_i.offset(i as isize) as *mut pbc_bkem_sys::element_s;
+                serialize_element(&mut out, elem);
+            }
+
+            Ok(out)
+        }
+    }
+
     /// Export a user's private key as bytes.
     pub fn export_user_key(&self, index: u32) -> Result<Vec<u8>> {
         let n = self.num_users();
@@ -265,29 +301,74 @@ impl BgwSystem {
         }
     }
 
-    /// Decrypt: recover AES key from a BGW header using a user's private key.
+    /// Decrypt: recover AES key from a BGW header using a user's private key
+    /// and the distributor's serialized public key.
     ///
     /// `d_i_bytes` is the serialized PBC element for this user's private key.
-    /// The recipient set S is required by the BGW math (used to compute the
-    /// decryption pairing). If the user is not in S, `get_decryption_key`
-    /// produces an incorrect K and AES-GCM will reject the ciphertext.
+    /// `pk_bytes` is the distributor's public key (from export_public_key).
+    /// The recipient set S is required by the BGW math. If the user is not
+    /// in S, `get_decryption_key` produces an incorrect K and AES-GCM will
+    /// reject the ciphertext.
     pub fn decapsulate(
         &self,
         user_index: u32,
         d_i_bytes: &[u8],
         recipients: &[u32],
         header: &[Vec<u8>],
+        pk_bytes: &[u8],
     ) -> Result<[u8; 32]> {
-        let a = unsafe { (*self.gps).A as usize };
-        if header.len() != a + 1 {
-            return Err(HimitsuError::Decryption(format!(
-                "Header has {} elements, expected {}",
-                header.len(), a + 1
-            )));
-        }
-
         unsafe {
-            // Deserialize the user's private key element
+            // Deserialize the distributor's public key
+            let mut cursor = 0usize;
+            let a = read_u32(pk_bytes, &mut cursor) as usize;
+            let _b = read_u32(pk_bytes, &mut cursor);
+
+            if header.len() != a + 1 {
+                return Err(HimitsuError::Decryption(format!(
+                    "Header has {} elements, expected {}",
+                    header.len(), a + 1
+                )));
+            }
+
+            let pk = libc::malloc(std::mem::size_of::<pbc_bkem_sys::pubkey_s>())
+                as pbc_bkem_sys::pubkey_t;
+
+            // g
+            pbc_bkem_sys::himitsu_element_init_G1(
+                (*pk).g.as_mut_ptr(),
+                (*self.gps).pairing.as_mut_ptr(),
+            );
+            deserialize_element((*pk).g.as_mut_ptr(), pk_bytes, &mut cursor);
+
+            // g_i
+            let num_gi = read_u32(pk_bytes, &mut cursor) as usize;
+            (*pk).g_i = libc::malloc(
+                num_gi * std::mem::size_of::<pbc_bkem_sys::element_t>(),
+            ) as *mut pbc_bkem_sys::element_t;
+            for i in 0..num_gi {
+                let elem = (*(*pk).g_i.offset(i as isize)).as_mut_ptr();
+                pbc_bkem_sys::himitsu_element_init_G1(
+                    elem,
+                    (*self.gps).pairing.as_mut_ptr(),
+                );
+                deserialize_element(elem, pk_bytes, &mut cursor);
+            }
+
+            // v_i
+            let num_vi = read_u32(pk_bytes, &mut cursor) as usize;
+            (*pk).v_i = libc::malloc(
+                num_vi * std::mem::size_of::<pbc_bkem_sys::element_t>(),
+            ) as *mut pbc_bkem_sys::element_t;
+            for i in 0..num_vi {
+                let elem = (*(*pk).v_i.offset(i as isize)).as_mut_ptr();
+                pbc_bkem_sys::himitsu_element_init_G1(
+                    elem,
+                    (*self.gps).pairing.as_mut_ptr(),
+                );
+                deserialize_element(elem, pk_bytes, &mut cursor);
+            }
+
+            // Deserialize user's private key
             let mut d_i = std::mem::zeroed::<pbc_bkem_sys::element_t>();
             pbc_bkem_sys::himitsu_element_init_G1(
                 d_i.as_mut_ptr(),
@@ -324,7 +405,7 @@ impl BgwSystem {
                 user_index as i32,
                 d_i.as_mut_ptr(),
                 hdr_raw as *mut pbc_bkem_sys::element_t as *mut _,
-                (*self.sys).PK,
+                pk,
             );
 
             let k_ptr = k.as_mut_ptr();
@@ -340,6 +421,18 @@ impl BgwSystem {
                 pbc_bkem_sys::himitsu_element_clear((*hdr_raw.offset(i as isize)).as_mut_ptr());
             }
             libc::free(hdr_raw as *mut libc::c_void);
+
+            // Free PK
+            pbc_bkem_sys::himitsu_element_clear((*pk).g.as_mut_ptr());
+            for i in 0..num_gi {
+                pbc_bkem_sys::himitsu_element_clear((*(*pk).g_i.offset(i as isize)).as_mut_ptr());
+            }
+            for i in 0..num_vi {
+                pbc_bkem_sys::himitsu_element_clear((*(*pk).v_i.offset(i as isize)).as_mut_ptr());
+            }
+            libc::free((*pk).g_i as *mut libc::c_void);
+            libc::free((*pk).v_i as *mut libc::c_void);
+            libc::free(pk as *mut libc::c_void);
 
             Ok(aes_key)
         }
@@ -497,6 +590,7 @@ pub fn decrypt<R: std::io::Read>(
     bgw: &BgwSystem,
     user_index: u32,
     d_i_bytes: &[u8],
+    pk_bytes: &[u8],
     input: &mut R,
 ) -> Result<(Vec<u8>, BroadcastHeader)> {
     use aes_gcm::{Aes256Gcm, Key, Nonce};
@@ -507,7 +601,7 @@ pub fn decrypt<R: std::io::Read>(
     let hdr = read_file_header(input)?;
 
     // BGW key decapsulation
-    let aes_key = bgw.decapsulate(user_index, d_i_bytes, &hdr.recipients, &hdr.header)?;
+    let aes_key = bgw.decapsulate(user_index, d_i_bytes, &hdr.recipients, &hdr.header, pk_bytes)?;
     let key = Key::<Aes256Gcm>::from_slice(&aes_key);
     let base_nonce = &hdr.nonce;
 

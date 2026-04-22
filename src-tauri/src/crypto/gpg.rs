@@ -44,8 +44,10 @@ pub fn fingerprint_hex(key: &pgp::composed::SignedPublicKey) -> String {
 
 /// Encrypt arbitrary binary data to a GPG public key.
 ///
-/// Selects the first encryption-capable subkey (ECDH/X25519); falls back
-/// to the primary key if none exists.
+/// Uses the first encryption-capable subkey (ECDH/X25519/RSA-E).
+/// If none exists, falls back to the primary key if it supports encryption
+/// (RSA with encryption flag). Rejects keys that have no encryption
+/// capability at all.
 pub fn encrypt_to_key(
     data: &[u8],
     public_key: &pgp::composed::SignedPublicKey,
@@ -56,6 +58,7 @@ pub fn encrypt_to_key(
 
     let msg = Message::new_literal_bytes("encrypted.bin", data);
 
+    // Prefer encryption subkey
     let enc_subkey = public_key
         .public_subkeys
         .iter()
@@ -67,12 +70,19 @@ pub fn encrypt_to_key(
             SymmetricKeyAlgorithm::AES256,
             &[&subkey.key],
         )
-    } else {
+    } else if public_key.primary_key.is_encryption_key() {
         msg.encrypt_to_keys_seipdv1(
             &mut rand::thread_rng(),
             SymmetricKeyAlgorithm::AES256,
             &[&public_key.primary_key],
         )
+    } else {
+        return Err(HimitsuError::Gpg(
+            "This GPG key has no encryption capability. \
+             It needs an encryption subkey (e.g. RSA, ECDH, or X25519). \
+             Please generate a new key with: gpg --full-generate-key"
+                .into(),
+        ));
     }
     .map_err(|e| HimitsuError::Gpg(format!("Encryption failed: {e}")))?;
 

@@ -19,14 +19,14 @@ export default function ReceiverSettings({ onKeyChanged }: Props) {
   const [confirmDelete, setConfirmDelete] = useState<ReceiverKeyInfo | null>(null);
 
   const refresh = async () => {
-    try { setKeys(await invoke<ReceiverKeyInfo[]>("list_receiver_keys")); } catch (_) {}
+    try { setKeys(await invoke<ReceiverKeyInfo[]>("list_keys")); } catch (_) {}
   };
 
   useEffect(() => { refresh(); }, []);
 
   const activate = async (key: ReceiverKeyInfo) => {
     try {
-      await invoke("set_active_receiver_key", { keyId: key.id });
+      await invoke("set_active_key", { keyId: key.id });
       setStatus({ ok: true, msg: `"${key.label}" is now the active decryption key.` });
       refresh();
       onKeyChanged();
@@ -38,7 +38,7 @@ export default function ReceiverSettings({ onKeyChanged }: Props) {
   const executeDelete = async () => {
     if (!confirmDelete) return;
     try {
-      await invoke("delete_receiver_key", { keyId: confirmDelete.id });
+      await invoke("delete_key", { keyId: confirmDelete.id });
       setStatus({ ok: true, msg: `"${confirmDelete.label}" deleted.` });
       refresh();
       onKeyChanged();
@@ -166,7 +166,7 @@ function AddReceiverKey({ onBack, onAdded }: { onBack: () => void; onAdded: () =
     setLoading(true);
     setError("");
     try {
-      await invoke("import_receiver_key", {
+      await invoke("import_key", {
         encryptedBytes: Array.from(encryptedUsk),
         armoredSecretKey: gpgPrivKey.trim(),
         passphrase,

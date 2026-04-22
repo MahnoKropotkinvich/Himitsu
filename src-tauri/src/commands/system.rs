@@ -1,38 +1,53 @@
-//! BGW broadcast system initialization.
+//! System initialization.
+//!
+//! With the namespace model, BGW systems are created per-namespace via
+//! `create_namespace`. This command now just performs startup checks and
+//! restores the active namespace if one was previously set.
 
 use tauri::State;
 
 use crate::AppState;
-use crate::crypto::bgw;
-use crate::storage::schema::CF_BGW_SYSTEM;
+use crate::storage::schema::{CF_NAMESPACES, CF_CONFIG};
 
-/// Ensure the BGW broadcast system is initialized.
+/// Perform startup initialization.
 ///
-/// Loads from DB on restart, or generates + persists on first launch.
-/// Returns `true` if a new system was generated.
+/// Restores the previously active namespace (if any). Returns `true` if
+/// at least one namespace exists.
 #[tauri::command]
 pub fn ensure_initialized(
     state: State<'_, AppState>,
 ) -> std::result::Result<bool, String> {
-    let mut bgw_guard = state.bgw.lock().unwrap();
-    if bgw_guard.is_some() {
-        return Ok(false);
-    }
-
     let db = state.db.lock().unwrap();
 
-    if let Some(data) = db.get_cf(CF_BGW_SYSTEM, b"bgw_system").map_err(|e| e.to_string())? {
-        tracing::info!("Loading BGW system from database");
-        let sys = bgw::BgwSystem::load(&data).map_err(|e| e.to_string())?;
-        *bgw_guard = Some(sys);
-        return Ok(false);
+    // Restore active namespace from config
+    if let Some(ns_id_bytes) = db.get_cf(CF_CONFIG, b"active_namespace")
+        .map_err(|e| e.to_string())?
+    {
+        let ns_id = String::from_utf8_lossy(&ns_id_bytes).to_string();
+        // Verify namespace still exists
+        if db.get_cf(CF_NAMESPACES, ns_id.as_bytes())
+            .map_err(|e| e.to_string())?
+            .is_some()
+        {
+            *state.active_namespace.lock().unwrap() = Some(ns_id.clone());
+            // Eagerly load BGW system for active namespace
+            drop(db);
+            super::namespace::load_bgw_system(&ns_id, &state)?;
+            return Ok(true);
+        }
     }
 
-    tracing::info!("First launch: generating BGW broadcast system (N={})", bgw::MAX_USERS);
-    let sys = bgw::BgwSystem::generate().map_err(|e| e.to_string())?;
-    let serialized = sys.serialize().map_err(|e| e.to_string())?;
-    db.put_cf(CF_BGW_SYSTEM, b"bgw_system", &serialized).map_err(|e| e.to_string())?;
-    tracing::info!(bytes = serialized.len(), "BGW system persisted to database");
-    *bgw_guard = Some(sys);
-    Ok(true)
+    // Check if any namespaces exist
+    let entries = db.iter_cf(CF_NAMESPACES).map_err(|e| e.to_string())?;
+    if let Some((k, _v)) = entries.first() {
+        let ns_id = String::from_utf8_lossy(k).to_string();
+        *state.active_namespace.lock().unwrap() = Some(ns_id.clone());
+        db.put_cf(CF_CONFIG, b"active_namespace", ns_id.as_bytes())
+            .map_err(|e| e.to_string())?;
+        drop(db);
+        super::namespace::load_bgw_system(&ns_id, &state)?;
+        return Ok(true);
+    }
+
+    Ok(false)
 }

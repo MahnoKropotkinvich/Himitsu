@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "himitsu"
-version = "0.2.0"
+version = "0.2.0e"
 description = "Broadcast encryption key management with traitor tracing"
 authors = ["you"]
 edition = "2021"

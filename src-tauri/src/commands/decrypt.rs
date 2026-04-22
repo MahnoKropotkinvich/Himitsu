@@ -11,20 +11,47 @@ use crate::util::file_type;
 
 /// Shared helper: open an HMT2 source and decrypt it.
 ///
-/// Returns `(plaintext, header)`.
+/// The receiver's ReceiverKey contains the distributor's PK, so we don't
+/// need the local namespace's BGW system. We only need a BgwSystem for the
+/// pairing context (gps), which is the same across all namespaces.
 fn decrypt_from_reader<R: std::io::Read>(
     input: &mut R,
     state: &State<'_, AppState>,
 ) -> std::result::Result<(Vec<u8>, bgw::BroadcastHeader), String> {
     let rk = {
         let db = state.db.lock().unwrap();
-        super::keys::load_active_rk(&db)?
+        super::receiver::load_active(&db)?
     };
 
-    let bgw_guard = state.bgw.lock().unwrap();
-    let bgw_sys = bgw_guard.as_ref().ok_or("BGW system not initialized")?;
+    // We need any BgwSystem just for the pairing context (gps).
+    // If none loaded, load or generate a temporary one.
+    {
+        let bgw_map = state.bgw.lock().unwrap();
+        if bgw_map.is_empty() {
+            drop(bgw_map);
+            // Load the first namespace's BGW system, or generate a temp one
+            let db = state.db.lock().unwrap();
+            let entries = db.iter_cf(crate::storage::schema::CF_NAMESPACES)
+                .map_err(|e| e.to_string())?;
+            if let Some((k, _)) = entries.first() {
+                let ns_id = String::from_utf8_lossy(k).to_string();
+                drop(db);
+                super::namespace::load_bgw_system(&ns_id, state)?;
+            } else {
+                // No namespaces exist — receiver-only mode.
+                // Generate a temporary BGW system just for gps.
+                drop(db);
+                let tmp = bgw::BgwSystem::generate().map_err(|e| e.to_string())?;
+                state.bgw.lock().unwrap().insert("__receiver_tmp__".into(), tmp);
+            }
+        }
+    }
 
-    let (plaintext, hdr) = bgw::decrypt(bgw_sys, rk.bgw_index, &rk.usk_bytes, input)
+    let bgw_guard = state.bgw.lock().unwrap();
+    let bgw_sys = bgw_guard.values().next()
+        .ok_or("No BGW pairing context available")?;
+
+    let (plaintext, hdr) = bgw::decrypt(bgw_sys, rk.bgw_index, &rk.usk_bytes, &rk.pk_bytes, input)
         .map_err(|e| {
             tracing::error!(error = %e, "Decryption failed");
             e.to_string()
