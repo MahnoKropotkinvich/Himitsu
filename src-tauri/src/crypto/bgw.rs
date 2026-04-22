@@ -1,9 +1,17 @@
 //! BGW Broadcast Key Encapsulation Mechanism wrapper.
 //!
-//! The BGW system (pairing context + public keys) lives in AppState.
-//! User private keys are serialized via PBC's element_to_bytes for
-//! distribution. Decryption uses the receiver's own private key bytes
-//! rather than reading from the system's key array.
+//! ## File format (v2 — streaming)
+//!
+//! ```text
+//! [4 bytes: magic b"HMT2"]
+//! [bincode: BroadcastHeader]          ← small metadata, read first
+//! [u32: chunk_0_ciphertext_len][chunk_0_bytes]
+//! [u32: chunk_1_ciphertext_len][chunk_1_bytes]
+//! ...                                 ← read until EOF
+//! ```
+//!
+//! Encrypt pipeline: input → zstd::Encoder(mt) → ChunkEncryptor → File
+//! Decrypt pipeline: File → ChunkDecryptor → zstd::Decoder → output
 //!
 //! Revocation = exclude user from the recipient set at encryption time.
 
@@ -11,31 +19,34 @@ use serde::{Deserialize, Serialize};
 use sha2::{Sha256, Digest};
 use crate::error::{HimitsuError, Result};
 use std::ffi::CString;
+use std::io::{self, Read, Write};
 
 /// Maximum number of users in the system.
 pub const MAX_USERS: usize = 1000;
 
-/// 1 MiB chunk size for parallel AES-GCM.
+/// 1 MiB chunk size for AES-GCM.
 pub const CHUNK_SIZE: usize = 1 << 20;
+
+/// File format magic bytes.
+pub const MAGIC: [u8; 4] = *b"HMT2";
 
 /// Type-A pairing parameters for PBC.
 const PAIRING_PARAMS: &str = "type a\nq 8780710799663312522437781984754049815806883199414208211028653399266475630880222957078625179422662221423155858769582317459277713367317481324925129998224791\nh 12016012264891146079388821366740534204802954401251311822919615131047207289359704531102844802183906537786776\nr 730750818665451621361119245571504901405976559617\nexp2 159\nexp1 107\nsign1 1\nsign0 1\n";
 
-/// Encrypted payload format.
+/// File header — small, written/read first before any chunk data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BroadcastCiphertext {
+pub struct BroadcastHeader {
     /// Serialized BGW header elements.
     pub header: Vec<Vec<u8>>,
     /// Indices of authorized users (required by BGW decryption math).
     pub recipients: Vec<u32>,
     /// Base nonce (8 bytes) for chunked AES-GCM.
     pub nonce: Vec<u8>,
-    /// Encrypted data chunks.
-    pub chunks: Vec<Vec<u8>>,
+    /// Plaintext chunk size before AES-GCM encryption.
     pub chunk_size: usize,
-    pub compressed: bool,
+    /// Whether the plaintext is a tar archive (encrypted folder).
+    pub is_folder: bool,
     /// Original filename (preserved across encrypt/decrypt).
-    #[serde(default)]
     pub filename: Option<String>,
 }
 
@@ -353,104 +364,207 @@ impl Drop for BgwSystem {
     }
 }
 
-/// High-level encrypt: compress + BGW encapsulate + chunked AES-GCM.
-pub fn encrypt(
-    bgw: &BgwSystem,
-    recipients: &[u32],
-    plaintext: &[u8],
-    filename: Option<String>,
-) -> Result<BroadcastCiphertext> {
-    use aes_gcm::{Aes256Gcm, Key, Nonce};
-    use aes_gcm::aead::{Aead, KeyInit};
-    use rayon::prelude::*;
-
-    let compressed = {
-        use std::io::Write;
-        let mut enc = zstd::Encoder::new(Vec::new(), 3)
-            .map_err(|e| HimitsuError::Broadcast(format!("zstd: {e}")))?;
-        let _ = enc.set_parameter(zstd::zstd_safe::CParameter::NbWorkers(num_cpus::get() as u32));
-        enc.write_all(plaintext).map_err(|e| HimitsuError::Broadcast(format!("zstd: {e}")))?;
-        enc.finish().map_err(|e| HimitsuError::Broadcast(format!("zstd: {e}")))?
-    };
-
-    let (header, aes_key) = bgw.encapsulate(recipients)?;
-
-    let base_nonce: [u8; 8] = rand::random();
-    let key = Key::<Aes256Gcm>::from_slice(&aes_key);
-
-    let chunk_results: Vec<_> = compressed
-        .par_chunks(CHUNK_SIZE)
-        .enumerate()
-        .map(|(idx, chunk)| {
-            let cipher = Aes256Gcm::new(key);
-            let mut nonce_buf = [0u8; 12];
-            nonce_buf[..8].copy_from_slice(&base_nonce);
-            nonce_buf[8..12].copy_from_slice(&(idx as u32).to_be_bytes());
-            let nonce = Nonce::from_slice(&nonce_buf);
-            cipher.encrypt(nonce, chunk)
-                .map_err(|e| format!("AES-GCM chunk {idx}: {e}"))
-        })
-        .collect();
-
-    let chunks = chunk_results.into_iter()
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| HimitsuError::Broadcast(e))?;
-
-    Ok(BroadcastCiphertext {
-        header,
-        recipients: recipients.to_vec(),
-        nonce: base_nonce.to_vec(),
-        chunks,
-        chunk_size: CHUNK_SIZE,
-        compressed: true,
-        filename,
-    })
+/// Write the file magic + header to a writer.
+pub fn write_file_header<W: Write>(w: &mut W, hdr: &BroadcastHeader) -> Result<()> {
+    w.write_all(&MAGIC)
+        .map_err(|e| HimitsuError::Broadcast(format!("write magic: {e}")))?;
+    bincode::serialize_into(w, hdr)
+        .map_err(|e| HimitsuError::Broadcast(format!("write header: {e}")))?;
+    Ok(())
 }
 
-/// High-level decrypt: BGW decapsulate + chunked AES-GCM + decompress.
-pub fn decrypt(
-    bgw: &BgwSystem,
-    user_index: u32,
-    d_i_bytes: &[u8],
-    ct: &BroadcastCiphertext,
-) -> Result<Vec<u8>> {
-    use aes_gcm::{Aes256Gcm, Key, Nonce};
-    use aes_gcm::aead::{Aead, KeyInit};
-    use rayon::prelude::*;
+/// Read and validate file magic + header from a reader.
+pub fn read_file_header<R: Read>(r: &mut R) -> Result<BroadcastHeader> {
+    let mut magic = [0u8; 4];
+    r.read_exact(&mut magic)
+        .map_err(|e| HimitsuError::Decryption(format!("read magic: {e}")))?;
+    if magic != MAGIC {
+        return Err(HimitsuError::Decryption(
+            "Not a valid .himitsu file (bad magic)".into(),
+        ));
+    }
+    bincode::deserialize_from(r)
+        .map_err(|e| HimitsuError::Decryption(format!("read header: {e}")))
+}
 
-    let aes_key = bgw.decapsulate(user_index, d_i_bytes, &ct.recipients, &ct.header)?;
+// ---------------------------------------------------------------------------
+// Streaming encrypt: impl Write that buffers → AES-GCM encrypts → writes
+// ---------------------------------------------------------------------------
 
-    let key = Key::<Aes256Gcm>::from_slice(&aes_key);
-    let base_nonce = &ct.nonce;
+/// Wraps a writer, buffering compressed data into CHUNK_SIZE windows,
+/// AES-GCM encrypting each, and writing `[u32 len][ciphertext]` pairs.
+pub struct ChunkEncryptor<W: Write> {
+    writer: W,
+    key: [u8; 32],
+    base_nonce: [u8; 8],
+    buffer: Vec<u8>,
+    chunk_index: u32,
+    chunk_size: usize,
+}
 
-    let chunk_results: Vec<_> = ct.chunks
-        .par_iter()
-        .enumerate()
-        .map(|(idx, enc_chunk)| {
-            let cipher = Aes256Gcm::new(key);
-            let mut nonce_buf = [0u8; 12];
-            nonce_buf[..8].copy_from_slice(base_nonce);
-            nonce_buf[8..12].copy_from_slice(&(idx as u32).to_be_bytes());
-            let nonce = Nonce::from_slice(&nonce_buf);
-            cipher.decrypt(nonce, enc_chunk.as_ref())
-                .map_err(|e| format!("AES-GCM chunk {idx}: {e}"))
-        })
-        .collect();
-
-    let plain_chunks = chunk_results.into_iter()
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| HimitsuError::Decryption(e))?;
-
-    let mut decrypted = Vec::with_capacity(plain_chunks.iter().map(|c| c.len()).sum());
-    for chunk in plain_chunks {
-        decrypted.extend_from_slice(&chunk);
+impl<W: Write> ChunkEncryptor<W> {
+    pub fn new(writer: W, key: [u8; 32], base_nonce: [u8; 8], chunk_size: usize) -> Self {
+        Self {
+            writer,
+            key,
+            base_nonce,
+            buffer: Vec::with_capacity(chunk_size),
+            chunk_index: 0,
+            chunk_size,
+        }
     }
 
-    if ct.compressed {
-        zstd::decode_all(decrypted.as_slice())
-            .map_err(|e| HimitsuError::Decryption(format!("zstd: {e}")))
-    } else {
-        Ok(decrypted)
+    /// Encrypt and flush the current buffer as one chunk.
+    fn flush_chunk(&mut self) -> io::Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+
+        use aes_gcm::{Aes256Gcm, Key, Nonce};
+        use aes_gcm::aead::{Aead, KeyInit};
+
+        let key = Key::<Aes256Gcm>::from_slice(&self.key);
+        let cipher = Aes256Gcm::new(key);
+
+        let mut nonce_buf = [0u8; 12];
+        nonce_buf[..8].copy_from_slice(&self.base_nonce);
+        nonce_buf[8..12].copy_from_slice(&self.chunk_index.to_be_bytes());
+        let nonce = Nonce::from_slice(&nonce_buf);
+
+        let ciphertext = cipher
+            .encrypt(nonce, self.buffer.as_ref())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("AES-GCM: {e}")))?;
+
+        let len = ciphertext.len() as u32;
+        self.writer.write_all(&len.to_le_bytes())?;
+        self.writer.write_all(&ciphertext)?;
+
+        self.buffer.clear();
+        self.chunk_index += 1;
+        Ok(())
+    }
+
+    /// Flush any remaining data and return the inner writer.
+    pub fn finish(mut self) -> io::Result<W> {
+        self.flush_chunk()?;
+        self.writer.flush()?;
+        Ok(self.writer)
+    }
+}
+
+impl<W: Write> Write for ChunkEncryptor<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut written = 0;
+        while written < buf.len() {
+            let space = self.chunk_size - self.buffer.len();
+            let take = space.min(buf.len() - written);
+            self.buffer.extend_from_slice(&buf[written..written + take]);
+            written += take;
+            if self.buffer.len() >= self.chunk_size {
+                self.flush_chunk()?;
+            }
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        // Don't flush_chunk here — partial chunks are only flushed on finish().
+        // This flush propagates to the inner writer for buffered I/O only.
+        self.writer.flush()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Streaming decrypt: impl Read that reads chunks → AES-GCM decrypts → yields
+// ---------------------------------------------------------------------------
+
+/// Wraps a reader, reading `[u32 len][ciphertext]` pairs, AES-GCM decrypting
+/// each, and yielding plaintext (compressed) bytes.
+pub struct ChunkDecryptor<R: Read> {
+    reader: R,
+    key: [u8; 32],
+    base_nonce: [u8; 8],
+    buffer: Vec<u8>,
+    buf_pos: usize,
+    chunk_index: u32,
+    done: bool,
+}
+
+impl<R: Read> ChunkDecryptor<R> {
+    pub fn new(reader: R, key: [u8; 32], base_nonce: &[u8]) -> Self {
+        let mut nonce = [0u8; 8];
+        nonce.copy_from_slice(&base_nonce[..8]);
+        Self {
+            reader,
+            key,
+            base_nonce: nonce,
+            buffer: Vec::new(),
+            buf_pos: 0,
+            chunk_index: 0,
+            done: false,
+        }
+    }
+
+    /// Read and decrypt the next chunk into the internal buffer.
+    fn load_next_chunk(&mut self) -> io::Result<bool> {
+        // Read chunk length (u32 LE)
+        let mut len_buf = [0u8; 4];
+        match self.reader.read_exact(&mut len_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                self.done = true;
+                return Ok(false);
+            }
+            Err(e) => return Err(e),
+        }
+
+        let ct_len = u32::from_le_bytes(len_buf) as usize;
+        let mut ct_buf = vec![0u8; ct_len];
+        self.reader.read_exact(&mut ct_buf)?;
+
+        use aes_gcm::{Aes256Gcm, Key, Nonce};
+        use aes_gcm::aead::{Aead, KeyInit};
+
+        let key = Key::<Aes256Gcm>::from_slice(&self.key);
+        let cipher = Aes256Gcm::new(key);
+
+        let mut nonce_buf = [0u8; 12];
+        nonce_buf[..8].copy_from_slice(&self.base_nonce);
+        nonce_buf[8..12].copy_from_slice(&self.chunk_index.to_be_bytes());
+        let nonce = Nonce::from_slice(&nonce_buf);
+
+        let plaintext = cipher
+            .decrypt(nonce, ct_buf.as_ref())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("AES-GCM: {e}")))?;
+
+        self.buffer = plaintext;
+        self.buf_pos = 0;
+        self.chunk_index += 1;
+        Ok(true)
+    }
+}
+
+impl<R: Read> Read for ChunkDecryptor<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            // Serve from current buffer
+            if self.buf_pos < self.buffer.len() {
+                let avail = self.buffer.len() - self.buf_pos;
+                let n = avail.min(buf.len());
+                buf[..n].copy_from_slice(&self.buffer[self.buf_pos..self.buf_pos + n]);
+                self.buf_pos += n;
+                return Ok(n);
+            }
+
+            if self.done {
+                return Ok(0);
+            }
+
+            // Load next chunk
+            if !self.load_next_chunk()? {
+                return Ok(0);
+            }
+        }
     }
 }
 
