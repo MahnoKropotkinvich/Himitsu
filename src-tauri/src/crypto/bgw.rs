@@ -21,19 +21,25 @@ pub const CHUNK_SIZE: usize = 1 << 20;
 /// Type-A pairing parameters for PBC.
 const PAIRING_PARAMS: &str = "type a\nq 8780710799663312522437781984754049815806883199414208211028653399266475630880222957078625179422662221423155858769582317459277713367317481324925129998224791\nh 12016012264891146079388821366740534204802954401251311822919615131047207289359704531102844802183906537786776\nr 730750818665451621361119245571504901405976559617\nexp2 159\nexp1 107\nsign1 1\nsign0 1\n";
 
-/// Encrypted payload format.
+/// HMT2 file magic bytes.
+pub const MAGIC: &[u8; 4] = b"HMT2";
+
+/// File header — serialized with bincode after the magic bytes.
+///
+/// Does NOT contain chunk data; chunks follow immediately after the header
+/// in the file as `[u32 LE: ciphertext_len][ciphertext][16-byte tag]` each.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BroadcastCiphertext {
+pub struct BroadcastHeader {
     /// Serialized BGW header elements.
     pub header: Vec<Vec<u8>>,
     /// Indices of authorized users (required by BGW decryption math).
     pub recipients: Vec<u32>,
     /// Base nonce (8 bytes) for chunked AES-GCM.
     pub nonce: Vec<u8>,
-    /// Encrypted data chunks.
-    pub chunks: Vec<Vec<u8>>,
+    /// Chunk size used during encryption.
     pub chunk_size: usize,
-    pub compressed: bool,
+    /// Whether the payload is a tar archive (folder).
+    pub is_folder: bool,
     /// Original filename (preserved across encrypt/decrypt).
     #[serde(default)]
     pub filename: Option<String>,
@@ -353,31 +359,110 @@ impl Drop for BgwSystem {
     }
 }
 
-/// High-level encrypt: compress + BGW encapsulate + chunked AES-GCM.
-pub fn encrypt(
+// ---------------------------------------------------------------------------
+// HMT2 file I/O helpers
+// ---------------------------------------------------------------------------
+
+/// Write the HMT2 magic + bincode-serialized header to a writer.
+pub fn write_file_header<W: std::io::Write>(w: &mut W, hdr: &BroadcastHeader) -> Result<()> {
+    w.write_all(MAGIC)
+        .map_err(|e| HimitsuError::Broadcast(format!("write magic: {e}")))?;
+    bincode::serialize_into(w, hdr)
+        .map_err(|e| HimitsuError::Broadcast(format!("write header: {e}")))?;
+    Ok(())
+}
+
+/// Read and validate the HMT2 magic + bincode-deserialized header from a reader.
+pub fn read_file_header<R: std::io::Read>(r: &mut R) -> Result<BroadcastHeader> {
+    let mut magic = [0u8; 4];
+    r.read_exact(&mut magic)
+        .map_err(|e| HimitsuError::Decryption(format!("read magic: {e}")))?;
+    if &magic != MAGIC {
+        return Err(HimitsuError::Decryption("Not an HMT2 file".into()));
+    }
+    let hdr: BroadcastHeader = bincode::deserialize_from(r)
+        .map_err(|e| HimitsuError::Decryption(format!("read header: {e}")))?;
+    Ok(hdr)
+}
+
+/// Write a single encrypted chunk: `[u32 LE: ciphertext_len][ciphertext][16-byte tag]`.
+///
+/// `aes_gcm::Aead::encrypt` returns ciphertext || tag concatenated, so we
+/// write the length prefix then the entire blob.
+fn write_chunk<W: std::io::Write>(w: &mut W, encrypted: &[u8]) -> Result<()> {
+    let len = encrypted.len() as u32;
+    w.write_all(&len.to_le_bytes())
+        .map_err(|e| HimitsuError::Broadcast(format!("write chunk len: {e}")))?;
+    w.write_all(encrypted)
+        .map_err(|e| HimitsuError::Broadcast(format!("write chunk data: {e}")))?;
+    Ok(())
+}
+
+/// Read a single encrypted chunk from the wire format.
+/// Returns `None` at EOF, `Some(bytes)` otherwise.
+fn read_chunk<R: std::io::Read>(r: &mut R) -> Result<Option<Vec<u8>>> {
+    let mut len_buf = [0u8; 4];
+    match r.read_exact(&mut len_buf) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(HimitsuError::Decryption(format!("read chunk len: {e}"))),
+    }
+    let len = u32::from_le_bytes(len_buf) as usize;
+    let mut buf = vec![0u8; len];
+    r.read_exact(&mut buf)
+        .map_err(|e| HimitsuError::Decryption(format!("read chunk data: {e}")))?;
+    Ok(Some(buf))
+}
+
+// ---------------------------------------------------------------------------
+// High-level encrypt / decrypt
+// ---------------------------------------------------------------------------
+
+/// Encrypt from a reader, write HMT2 to a writer.
+///
+/// Pipeline:
+///   input ──Read──→ zstd::Encoder(Vec, NbWorkers) ──→ compressed: Vec<u8>
+///   compressed.par_chunks(1 MiB) ──rayon──→ Vec<encrypted_chunk>
+///   write: [HMT2][BroadcastHeader][chunk0][chunk1]...
+pub fn encrypt<R: std::io::Read, W: std::io::Write>(
     bgw: &BgwSystem,
     recipients: &[u32],
-    plaintext: &[u8],
+    input: &mut R,
+    output: &mut W,
     filename: Option<String>,
-) -> Result<BroadcastCiphertext> {
+    is_folder: bool,
+) -> Result<()> {
     use aes_gcm::{Aes256Gcm, Key, Nonce};
     use aes_gcm::aead::{Aead, KeyInit};
     use rayon::prelude::*;
 
+    // Phase 1: streaming zstd compression → Vec<u8>
     let compressed = {
-        use std::io::Write;
         let mut enc = zstd::Encoder::new(Vec::new(), 3)
             .map_err(|e| HimitsuError::Broadcast(format!("zstd: {e}")))?;
         let _ = enc.set_parameter(zstd::zstd_safe::CParameter::NbWorkers(num_cpus::get() as u32));
-        enc.write_all(plaintext).map_err(|e| HimitsuError::Broadcast(format!("zstd: {e}")))?;
-        enc.finish().map_err(|e| HimitsuError::Broadcast(format!("zstd: {e}")))?
+        std::io::copy(input, &mut enc)
+            .map_err(|e| HimitsuError::Broadcast(format!("zstd write: {e}")))?;
+        enc.finish().map_err(|e| HimitsuError::Broadcast(format!("zstd finish: {e}")))?
     };
 
+    // BGW key encapsulation
     let (header, aes_key) = bgw.encapsulate(recipients)?;
-
     let base_nonce: [u8; 8] = rand::random();
     let key = Key::<Aes256Gcm>::from_slice(&aes_key);
 
+    // Write HMT2 header
+    let hdr = BroadcastHeader {
+        header,
+        recipients: recipients.to_vec(),
+        nonce: base_nonce.to_vec(),
+        chunk_size: CHUNK_SIZE,
+        is_folder,
+        filename,
+    };
+    write_file_header(output, &hdr)?;
+
+    // Phase 2: rayon parallel AES-GCM encryption
     let chunk_results: Vec<_> = compressed
         .par_chunks(CHUNK_SIZE)
         .enumerate()
@@ -392,38 +477,48 @@ pub fn encrypt(
         })
         .collect();
 
-    let chunks = chunk_results.into_iter()
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| HimitsuError::Broadcast(e))?;
+    // Phase 3: sequential write of encrypted chunks
+    for result in chunk_results {
+        let encrypted = result.map_err(|e| HimitsuError::Broadcast(e))?;
+        write_chunk(output, &encrypted)?;
+    }
 
-    Ok(BroadcastCiphertext {
-        header,
-        recipients: recipients.to_vec(),
-        nonce: base_nonce.to_vec(),
-        chunks,
-        chunk_size: CHUNK_SIZE,
-        compressed: true,
-        filename,
-    })
+    output.flush().map_err(|e| HimitsuError::Broadcast(format!("flush: {e}")))?;
+    Ok(())
 }
 
-/// High-level decrypt: BGW decapsulate + chunked AES-GCM + decompress.
-pub fn decrypt(
+/// Decrypt from an HMT2 reader, returning (plaintext bytes, BroadcastHeader).
+///
+/// Pipeline:
+///   read: [HMT2][BroadcastHeader][chunk0][chunk1]...
+///   chunks.par_iter() ──rayon──→ Vec<decrypted_chunk> ──concat──→ compressed
+///   zstd::decode_all ──→ plaintext
+pub fn decrypt<R: std::io::Read>(
     bgw: &BgwSystem,
     user_index: u32,
     d_i_bytes: &[u8],
-    ct: &BroadcastCiphertext,
-) -> Result<Vec<u8>> {
+    input: &mut R,
+) -> Result<(Vec<u8>, BroadcastHeader)> {
     use aes_gcm::{Aes256Gcm, Key, Nonce};
     use aes_gcm::aead::{Aead, KeyInit};
     use rayon::prelude::*;
 
-    let aes_key = bgw.decapsulate(user_index, d_i_bytes, &ct.recipients, &ct.header)?;
+    // Read header
+    let hdr = read_file_header(input)?;
 
+    // BGW key decapsulation
+    let aes_key = bgw.decapsulate(user_index, d_i_bytes, &hdr.recipients, &hdr.header)?;
     let key = Key::<Aes256Gcm>::from_slice(&aes_key);
-    let base_nonce = &ct.nonce;
+    let base_nonce = &hdr.nonce;
 
-    let chunk_results: Vec<_> = ct.chunks
+    // Read all encrypted chunks
+    let mut encrypted_chunks = Vec::new();
+    while let Some(chunk) = read_chunk(input)? {
+        encrypted_chunks.push(chunk);
+    }
+
+    // Parallel AES-GCM decryption
+    let chunk_results: Vec<_> = encrypted_chunks
         .par_iter()
         .enumerate()
         .map(|(idx, enc_chunk)| {
@@ -441,17 +536,16 @@ pub fn decrypt(
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| HimitsuError::Decryption(e))?;
 
-    let mut decrypted = Vec::with_capacity(plain_chunks.iter().map(|c| c.len()).sum());
+    let mut compressed = Vec::with_capacity(plain_chunks.iter().map(|c| c.len()).sum());
     for chunk in plain_chunks {
-        decrypted.extend_from_slice(&chunk);
+        compressed.extend_from_slice(&chunk);
     }
 
-    if ct.compressed {
-        zstd::decode_all(decrypted.as_slice())
-            .map_err(|e| HimitsuError::Decryption(format!("zstd: {e}")))
-    } else {
-        Ok(decrypted)
-    }
+    // zstd decompression
+    let plaintext = zstd::decode_all(compressed.as_slice())
+        .map_err(|e| HimitsuError::Decryption(format!("zstd: {e}")))?;
+
+    Ok((plaintext, hdr))
 }
 
 // ---------------------------------------------------------------------------

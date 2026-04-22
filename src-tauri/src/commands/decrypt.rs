@@ -1,13 +1,39 @@
 //! Decryption commands: file, folder, and inline content decryption.
 
+use std::io::BufReader;
+
 use tauri::State;
 
 use crate::AppState;
-use crate::crypto::bgw::{self, BroadcastCiphertext};
+use crate::crypto::bgw;
 use crate::storage::models::{DecryptResult, DecryptFileResult};
 use crate::util::file_type;
 
-/// Decrypt a ciphertext (base64-encoded bincode).
+/// Shared helper: open an HMT2 source and decrypt it.
+///
+/// Returns `(plaintext, header)`.
+fn decrypt_from_reader<R: std::io::Read>(
+    input: &mut R,
+    state: &State<'_, AppState>,
+) -> std::result::Result<(Vec<u8>, bgw::BroadcastHeader), String> {
+    let rk = {
+        let db = state.db.lock().unwrap();
+        super::keys::load_active_rk(&db)?
+    };
+
+    let bgw_guard = state.bgw.lock().unwrap();
+    let bgw_sys = bgw_guard.as_ref().ok_or("BGW system not initialized")?;
+
+    let (plaintext, hdr) = bgw::decrypt(bgw_sys, rk.bgw_index, &rk.usk_bytes, input)
+        .map_err(|e| {
+            tracing::error!(error = %e, "Decryption failed");
+            e.to_string()
+        })?;
+
+    Ok((plaintext, hdr))
+}
+
+/// Decrypt a ciphertext (base64-encoded HMT2 binary).
 ///
 /// Uses the active receiver key's BGW private key for decryption.
 #[tauri::command]
@@ -17,25 +43,12 @@ pub fn decrypt_content(
 ) -> std::result::Result<DecryptResult, String> {
     use base64::Engine;
 
-    let rk = {
-        let db = state.db.lock().unwrap();
-        super::keys::load_active_rk(&db)?
-    };
-
     let ct_bytes = base64::engine::general_purpose::STANDARD
         .decode(&ciphertext_base64)
         .map_err(|e| format!("Invalid ciphertext base64: {e}"))?;
-    let broadcast_ct: BroadcastCiphertext =
-        bincode::deserialize(&ct_bytes).map_err(|e| format!("Invalid ciphertext: {e}"))?;
 
-    let bgw_guard = state.bgw.lock().unwrap();
-    let bgw_sys = bgw_guard.as_ref().ok_or("BGW system not initialized")?;
-
-    let plaintext = bgw::decrypt(bgw_sys, rk.bgw_index, &rk.usk_bytes, &broadcast_ct)
-        .map_err(|e| {
-            tracing::error!(error = %e, "Decryption failed");
-            e.to_string()
-        })?;
+    let mut cursor = std::io::Cursor::new(&ct_bytes);
+    let (plaintext, _hdr) = decrypt_from_reader(&mut cursor, &state)?;
 
     let ft = file_type::detect_file_type(&plaintext);
     let (mime, extension, _category) = match &ft {
@@ -69,7 +82,7 @@ pub fn decrypt_content(
     })
 }
 
-/// Decrypt a file on disk.
+/// Decrypt a file on disk (non-folder).
 ///
 /// For files < 10 MiB, also returns base64 data for inline preview.
 #[tauri::command]
@@ -78,40 +91,19 @@ pub fn decrypt_file(
     state: State<'_, AppState>,
 ) -> std::result::Result<DecryptFileResult, String> {
     use base64::Engine;
-    use std::io::BufReader;
-
-    let rk = {
-        let db = state.db.lock().unwrap();
-        super::keys::load_active_rk(&db)?
-    };
 
     let file = std::fs::File::open(&input_path)
         .map_err(|e| format!("Failed to open ciphertext file: {e}"))?;
-    let reader = BufReader::new(file);
-    let broadcast_ct: BroadcastCiphertext =
-        bincode::deserialize_from(reader)
-            .map_err(|e| format!("Invalid ciphertext file: {e}"))?;
+    let mut reader = BufReader::new(file);
 
-    let original_name = broadcast_ct.filename.clone();
+    let (plaintext, hdr) = decrypt_from_reader(&mut reader, &state)?;
+    let original_name = hdr.filename.clone();
 
-    let bgw_guard = state.bgw.lock().unwrap();
-    let bgw_sys = bgw_guard.as_ref().ok_or("BGW system not initialized")?;
-
-    let plaintext = bgw::decrypt(bgw_sys, rk.bgw_index, &rk.usk_bytes, &broadcast_ct)
-        .map_err(|e| {
-            tracing::error!(error = %e, "File decryption failed");
-            e.to_string()
-        })?;
-
-    // Check if decrypted content is a tar archive (encrypted folder)
-    let is_tar = plaintext.len() > 262 && &plaintext[257..262] == b"ustar";
-
-    if is_tar {
+    // If the header says this is a folder, handle tar extraction
+    if hdr.is_folder {
         let dir = std::env::temp_dir().join("himitsu");
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
 
-        // Unpack directly into himitsu temp dir — tar already contains the
-        // top-level directory, no need to wrap in another dir_<uuid>.
         let cursor = std::io::Cursor::new(&plaintext);
         let mut archive = tar::Archive::new(cursor);
         archive.unpack(&dir)
@@ -215,30 +207,12 @@ pub fn decrypt_to_folder(
     input_path: String,
     state: State<'_, AppState>,
 ) -> std::result::Result<DecryptFileResult, String> {
-    use std::io::BufReader;
-
-    let rk = {
-        let db = state.db.lock().unwrap();
-        super::keys::load_active_rk(&db)?
-    };
-
     let file = std::fs::File::open(&input_path)
         .map_err(|e| format!("Failed to open ciphertext file: {e}"))?;
-    let reader = BufReader::new(file);
-    let broadcast_ct: BroadcastCiphertext =
-        bincode::deserialize_from(reader)
-            .map_err(|e| format!("Invalid ciphertext file: {e}"))?;
+    let mut reader = BufReader::new(file);
 
-    let original_name = broadcast_ct.filename.clone();
-
-    let bgw_guard = state.bgw.lock().unwrap();
-    let bgw_sys = bgw_guard.as_ref().ok_or("BGW system not initialized")?;
-
-    let plaintext = bgw::decrypt(bgw_sys, rk.bgw_index, &rk.usk_bytes, &broadcast_ct)
-        .map_err(|e| {
-            tracing::error!(error = %e, "Folder decryption failed");
-            e.to_string()
-        })?;
+    let (plaintext, hdr) = decrypt_from_reader(&mut reader, &state)?;
+    let original_name = hdr.filename.clone();
 
     let dir = std::env::temp_dir().join("himitsu");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
