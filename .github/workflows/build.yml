@@ -15,19 +15,37 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # ── macOS ──────────────────────────────────────────────
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: himitsu_*_aarch64.dmg
             artifact_dir: bundle/dmg
 
+          - os: macos-13
+            target: x86_64-apple-darwin
+            artifact: himitsu_*_x64.dmg
+            artifact_dir: bundle/dmg
+
+          # ── Linux ──────────────────────────────────────────────
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             artifact: 'himitsu_*.deb'
             artifact_dir: bundle/deb
 
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: 'himitsu_*.deb'
+            artifact_dir: bundle/deb
+
+          # ── Windows ────────────────────────────────────────────
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: 'himitsu_*_x64-setup.exe'
+            artifact_dir: bundle/nsis
+
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            artifact: 'himitsu_*_arm64-setup.exe'
             artifact_dir: bundle/nsis
 
     runs-on: ${{ matrix.os }}
@@ -77,7 +95,8 @@ jobs:
             libgmp-dev \
             clang \
             libclang-dev \
-            pkg-config
+            pkg-config \
+            xdg-utils
 
       # ── macOS system deps ──────────────────────────────────────
       - name: macOS system dependencies
@@ -93,31 +112,57 @@ jobs:
         shell: bash
         run: echo "VCPKG_ROOT=$VCPKG_INSTALLATION_ROOT" >> $GITHUB_ENV
 
-      - name: Restore vcpkg cache (Windows)
-        if: runner.os == 'Windows'
-        id: vcpkg-cache
+      - name: Restore vcpkg cache (Windows x64)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        id: vcpkg-cache-x64
         uses: actions/cache/restore@v4
         with:
           path: ${{ env.VCPKG_ROOT }}/installed
           key: vcpkg-x64-windows-gmp-v1
 
-      - name: Install GMP via vcpkg (Windows)
-        if: runner.os == 'Windows' && steps.vcpkg-cache.outputs.cache-hit != 'true'
+      - name: Install GMP via vcpkg (Windows x64)
+        if: matrix.target == 'x86_64-pc-windows-msvc' && steps.vcpkg-cache-x64.outputs.cache-hit != 'true'
         run: vcpkg install gmp:x64-windows-static-md
 
-      - name: Save vcpkg cache (Windows)
-        if: runner.os == 'Windows' && steps.vcpkg-cache.outputs.cache-hit != 'true'
+      - name: Save vcpkg cache (Windows x64)
+        if: matrix.target == 'x86_64-pc-windows-msvc' && steps.vcpkg-cache-x64.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: ${{ env.VCPKG_ROOT }}/installed
           key: vcpkg-x64-windows-gmp-v1
 
-      - name: Set vcpkg env (Windows)
-        if: runner.os == 'Windows'
+      - name: Set vcpkg env (Windows x64)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: bash
         run: |
           echo "GMP_LIB_DIR=$VCPKG_ROOT/installed/x64-windows-static-md/lib" >> $GITHUB_ENV
           echo "INCLUDE=$VCPKG_ROOT/installed/x64-windows-static-md/include" >> $GITHUB_ENV
+
+      - name: Restore vcpkg cache (Windows arm64)
+        if: matrix.target == 'aarch64-pc-windows-msvc'
+        id: vcpkg-cache-arm64
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.VCPKG_ROOT }}/installed
+          key: vcpkg-arm64-windows-gmp-v1
+
+      - name: Install GMP via vcpkg (Windows arm64)
+        if: matrix.target == 'aarch64-pc-windows-msvc' && steps.vcpkg-cache-arm64.outputs.cache-hit != 'true'
+        run: vcpkg install gmp:arm64-windows-static-md
+
+      - name: Save vcpkg cache (Windows arm64)
+        if: matrix.target == 'aarch64-pc-windows-msvc' && steps.vcpkg-cache-arm64.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.VCPKG_ROOT }}/installed
+          key: vcpkg-arm64-windows-gmp-v1
+
+      - name: Set vcpkg env (Windows arm64)
+        if: matrix.target == 'aarch64-pc-windows-msvc'
+        shell: bash
+        run: |
+          echo "GMP_LIB_DIR=$VCPKG_ROOT/installed/arm64-windows-static-md/lib" >> $GITHUB_ENV
+          echo "INCLUDE=$VCPKG_ROOT/installed/arm64-windows-static-md/include" >> $GITHUB_ENV
 
       # ── Build ─────────────────────────────────────────────────
       - name: Build Tauri app
@@ -142,7 +187,7 @@ jobs:
           retention-days: 30
 
       - name: Upload RPM (Linux only)
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        if: runner.os == 'Linux'
         uses: actions/upload-artifact@v4
         with:
           name: himitsu-${{ matrix.target }}-rpm
@@ -150,7 +195,7 @@ jobs:
           retention-days: 30
 
       - name: Upload AppImage (Linux only)
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        if: runner.os == 'Linux'
         uses: actions/upload-artifact@v4
         with:
           name: himitsu-${{ matrix.target }}-appimage

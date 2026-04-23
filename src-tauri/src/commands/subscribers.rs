@@ -131,18 +131,23 @@ pub fn import_subscriber_key(
     })
 }
 
-/// List all imported subscribers.
+/// List subscribers belonging to the active namespace.
 #[tauri::command]
 pub fn list_subscribers(
     state: State<'_, AppState>,
 ) -> std::result::Result<Vec<Applicant>, String> {
+    let namespace_id = super::namespace::require_active_namespace(&state)?;
     let db = state.db.lock().unwrap();
     let entries = db.iter_cf(CF_GPG_KEYS).map_err(|e| e.to_string())?;
 
     let mut applicants = Vec::new();
     for (k, v) in &entries {
         match bincode::deserialize::<Applicant>(v) {
-            Ok(a) => applicants.push(a),
+            Ok(a) => {
+                if a.namespace_id == namespace_id {
+                    applicants.push(a);
+                }
+            }
             Err(e) => {
                 tracing::warn!(
                     key = %hex::encode(k),

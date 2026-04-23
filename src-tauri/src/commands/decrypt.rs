@@ -187,11 +187,11 @@ pub fn decrypt_file(
         }
     };
 
-    // Use original filename for temp file if available
+    // Use original filename for temp file — no UUID prefix
     let dir = std::env::temp_dir().join("himitsu");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let filename = match &original_name {
-        Some(name) => format!("{}_{}", uuid::Uuid::new_v4(), name),
+        Some(name) => name.clone(),
         None => format!("dec_{}.{}", uuid::Uuid::new_v4(), extension),
     };
     let temp_path = dir.join(&filename);

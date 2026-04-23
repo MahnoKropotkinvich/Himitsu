@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
 import type { NamespaceInfo } from "../App";
@@ -34,8 +34,17 @@ export default function DistributorSettings({
   const [newNsName, setNewNsName] = useState("");
   const [nsCreating, setNsCreating] = useState(false);
 
+  // Namespace rename
+  const [renamingNsId, setRenamingNsId] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState("");
+  const renameInputRef = useRef<HTMLInputElement>(null);
+
+  // Namespace delete
+  const [confirmDeleteNs, setConfirmDeleteNs] = useState<NamespaceInfo | null>(null);
+
   const refresh = async () => {
-    try { setUsers(await invoke<Applicant[]>("list_subscribers")); } catch (_) {}
+    if (!activeNs) { setUsers([]); return; }
+    try { setUsers(await invoke<Applicant[]>("list_subscribers")); } catch (_) { setUsers([]); }
   };
 
   useEffect(() => { refresh(); }, [activeNs]);
@@ -52,6 +61,45 @@ export default function DistributorSettings({
       setStatus({ ok: false, msg: String(e) });
     }
     setNsCreating(false);
+  };
+
+  // Namespace rename
+  const startRename = (ns: NamespaceInfo) => {
+    setRenamingNsId(ns.id);
+    setRenameValue(ns.name);
+    setTimeout(() => renameInputRef.current?.focus(), 0);
+  };
+
+  const commitRename = async () => {
+    if (!renamingNsId || !renameValue.trim()) {
+      setRenamingNsId(null);
+      return;
+    }
+    try {
+      await invoke("rename_namespace", {
+        namespaceId: renamingNsId,
+        newName: renameValue.trim(),
+      });
+      onNamespacesChanged();
+    } catch (e: any) {
+      setStatus({ ok: false, msg: `Rename failed: ${e}` });
+    }
+    setRenamingNsId(null);
+  };
+
+  // Namespace delete
+  const executeDeleteNs = async () => {
+    if (!confirmDeleteNs) return;
+    try {
+      await invoke("delete_namespace", { namespaceId: confirmDeleteNs.id });
+      setStatus({ ok: true, msg: `Namespace "${confirmDeleteNs.name}" deleted.` });
+      onNamespacesChanged();
+      refresh();
+    } catch (e: any) {
+      setStatus({ ok: false, msg: `Delete namespace failed: ${e}` });
+    } finally {
+      setConfirmDeleteNs(null);
+    }
   };
 
   const toggleRevoke = async (user: Applicant) => {
@@ -118,8 +166,28 @@ export default function DistributorSettings({
               key={ns.id}
               className={`ns-item${ns.id === activeNs ? " active" : ""}`}
               onClick={() => onSelectNamespace(ns.id)}
+              onDoubleClick={() => startRename(ns)}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                setConfirmDeleteNs(ns);
+              }}
             >
-              <span className="ns-name">{ns.name}</span>
+              {renamingNsId === ns.id ? (
+                <input
+                  ref={renameInputRef}
+                  className="ns-rename-input"
+                  value={renameValue}
+                  onChange={(e) => setRenameValue(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") commitRename();
+                    if (e.key === "Escape") setRenamingNsId(null);
+                  }}
+                  onBlur={commitRename}
+                  onClick={(e) => e.stopPropagation()}
+                />
+              ) : (
+                <span className="ns-name">{ns.name}</span>
+              )}
               <span className="ns-seats">
                 {ns.available}/{ns.total_slots}
               </span>
@@ -237,7 +305,7 @@ export default function DistributorSettings({
               )}
             </div>
 
-            {/* Delete confirmation */}
+            {/* Delete subscriber confirmation */}
             {confirmDelete && (
               <div className="dialog-overlay" onClick={() => setConfirmDelete(null)}>
                 <div className="dialog" onClick={(e) => e.stopPropagation()}>
@@ -256,6 +324,28 @@ export default function DistributorSettings({
                   <div className="btn-row" style={{ justifyContent: "flex-end" }}>
                     <button className="btn btn-outline" onClick={() => setConfirmDelete(null)}>Cancel</button>
                     <button className="btn btn-danger" onClick={executeDelete}>Delete Permanently</button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Delete namespace confirmation */}
+            {confirmDeleteNs && (
+              <div className="dialog-overlay" onClick={() => setConfirmDeleteNs(null)}>
+                <div className="dialog" onClick={(e) => e.stopPropagation()}>
+                  <h3>Delete Namespace</h3>
+                  <p>
+                    Delete namespace <strong>{confirmDeleteNs.name}</strong>?
+                    <br /><br />
+                    This will permanently delete the namespace and all its subscribers,
+                    key slots, and BGW system. All {confirmDeleteNs.assigned} assigned
+                    subscribers will lose their keys.
+                    <br /><br />
+                    <strong>This cannot be undone.</strong>
+                  </p>
+                  <div className="btn-row" style={{ justifyContent: "flex-end" }}>
+                    <button className="btn btn-outline" onClick={() => setConfirmDeleteNs(null)}>Cancel</button>
+                    <button className="btn btn-danger" onClick={executeDeleteNs}>Delete Namespace</button>
                   </div>
                 </div>
               </div>

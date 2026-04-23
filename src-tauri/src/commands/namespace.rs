@@ -167,6 +167,111 @@ fn build_namespace_info(
     })
 }
 
+/// Rename a namespace.
+#[tauri::command]
+pub fn rename_namespace(
+    namespace_id: String,
+    new_name: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    let db = state.db.lock().unwrap();
+    let raw = db
+        .get_cf(CF_NAMESPACES, namespace_id.as_bytes())
+        .map_err(|e| e.to_string())?
+        .ok_or("Namespace not found")?;
+
+    let mut ns: Namespace = bincode::deserialize(&raw).map_err(|e| e.to_string())?;
+    ns.name = new_name.clone();
+
+    let data = bincode::serialize(&ns).map_err(|e| e.to_string())?;
+    db.put_cf(CF_NAMESPACES, namespace_id.as_bytes(), &data)
+        .map_err(|e| e.to_string())?;
+
+    tracing::info!(namespace_id = %namespace_id, new_name = %new_name, "Namespace renamed");
+    Ok(())
+}
+
+/// Delete a namespace and all its associated data (slots, BGW system,
+/// subscribers, keys, ledger entries).
+///
+/// If the deleted namespace is the active one, active_namespace is cleared.
+#[tauri::command]
+pub fn delete_namespace(
+    namespace_id: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    let db = state.db.lock().unwrap();
+
+    // Verify it exists
+    db.get_cf(CF_NAMESPACES, namespace_id.as_bytes())
+        .map_err(|e| e.to_string())?
+        .ok_or("Namespace not found")?;
+
+    // Collect user_ids belonging to this namespace (from KeySlots)
+    let prefix = format!("{}:", namespace_id);
+    let slots = db
+        .prefix_iter_cf(CF_KEY_SLOTS, prefix.as_bytes())
+        .map_err(|e| e.to_string())?;
+
+    let mut user_ids_to_delete = Vec::new();
+    for (k, v) in &slots {
+        if let Ok(slot) = bincode::deserialize::<KeySlot>(&v) {
+            if let Some(uid) = &slot.user_id {
+                user_ids_to_delete.push(uid.clone());
+            }
+        }
+        // Delete the slot itself
+        db.delete_cf(CF_KEY_SLOTS, k).map_err(|e| e.to_string())?;
+    }
+
+    // Delete subscribers (Applicants) that belong to this namespace
+    let all_gpg = db.iter_cf(CF_GPG_KEYS).map_err(|e| e.to_string())?;
+    for (k, v) in &all_gpg {
+        if let Ok(app) = bincode::deserialize::<crate::storage::models::Applicant>(v) {
+            if app.namespace_id == namespace_id {
+                db.delete_cf(CF_GPG_KEYS, k).map_err(|e| e.to_string())?;
+                db.delete_cf(CF_USER_KEYS, k).map_err(|e| e.to_string())?;
+                db.delete_cf(CF_ENCRYPTED_KEYS, k).map_err(|e| e.to_string())?;
+                db.delete_cf(CF_FINGERPRINTS, k).map_err(|e| e.to_string())?;
+            }
+        }
+    }
+
+    // Delete ledger entries referencing this namespace
+    let all_ledger = db.iter_cf(CF_LEDGER).map_err(|e| e.to_string())?;
+    for (k, v) in &all_ledger {
+        if let Ok(entry) = bincode::deserialize::<crate::storage::models::LedgerEntry>(v) {
+            if entry.policy_attributes.iter().any(|a| a == &format!("namespace:{}", namespace_id)) {
+                db.delete_cf(CF_LEDGER, k).map_err(|e| e.to_string())?;
+            }
+        }
+    }
+
+    // Delete BGW system
+    db.delete_cf(CF_BGW_SYSTEM, namespace_id.as_bytes())
+        .map_err(|e| e.to_string())?;
+
+    // Delete namespace metadata
+    db.delete_cf(CF_NAMESPACES, namespace_id.as_bytes())
+        .map_err(|e| e.to_string())?;
+
+    drop(db);
+
+    // Remove cached BGW system
+    state.bgw.lock().unwrap().remove(&namespace_id);
+
+    // Clear active namespace if it was the deleted one
+    {
+        let mut active = state.active_namespace.lock().unwrap();
+        if active.as_deref() == Some(&namespace_id) {
+            *active = None;
+        }
+    }
+
+    tracing::info!(namespace_id = %namespace_id, "Namespace deleted");
+    Ok(())
+}
+
 /// Helper: load or cache a BGW system for a namespace.
 pub fn load_bgw_system(
     namespace_id: &str,

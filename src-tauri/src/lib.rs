@@ -56,6 +56,8 @@ pub fn run() {
             commands::namespace::list_namespaces,
             commands::namespace::get_active_namespace,
             commands::namespace::set_active_namespace,
+            commands::namespace::rename_namespace,
+            commands::namespace::delete_namespace,
             // Subscribers (distributor-side)
             commands::subscribers::add_subscriber,
             commands::subscribers::import_subscriber_key,
