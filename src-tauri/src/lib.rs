@@ -47,6 +47,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_drag::init())
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             // System
@@ -85,9 +86,7 @@ pub fn run() {
             // Files
             commands::files::get_file_info,
             commands::files::save_temp_file,
-            // Ledger
-            commands::subscribers::get_ledger_entries,
-            commands::subscribers::search_ledger,
+            commands::files::fetch_url,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {

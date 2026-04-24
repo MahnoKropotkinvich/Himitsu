@@ -1,5 +1,6 @@
-//! File info and temp file management commands.
+//! File info, temp file management, and URL fetch commands.
 
+use serde::Serialize;
 use crate::storage::models::FileInfo;
 use crate::util::file_type;
 
@@ -97,6 +98,83 @@ pub fn save_temp_file(
     }
     tracing::info!(src = %temp_path, dest = %dest_path, "Temp file saved");
     Ok(())
+}
+
+/// Result of fetching a URL.
+#[derive(Debug, Clone, Serialize)]
+pub struct FetchUrlResult {
+    pub data_base64: String,
+    pub mime: String,
+    pub filename: String,
+    pub size: usize,
+}
+
+/// Maximum download size (100 MiB).
+const MAX_DOWNLOAD_SIZE: usize = 100 << 20;
+
+/// Fetch a URL and return its content as base64.
+///
+/// Only http:// and https:// schemes are allowed.
+#[tauri::command]
+pub fn fetch_url(url: String) -> std::result::Result<FetchUrlResult, String> {
+    use base64::Engine;
+
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err(format!("Unsupported URL scheme: {url}"));
+    }
+
+    let response = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("HTTP client error: {e}"))?
+        .get(&url)
+        .send()
+        .map_err(|e| format!("Fetch failed: {e}"))?;
+
+    if !response.status().is_success() {
+        return Err(format!("HTTP {}: {}", response.status(), url));
+    }
+
+    let mime = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(';').next().unwrap_or(s).trim().to_string())
+        .unwrap_or_else(|| "application/octet-stream".into());
+
+    // Extract filename from URL path or Content-Disposition
+    let filename = response
+        .headers()
+        .get("content-disposition")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| {
+            s.split("filename=").nth(1).map(|f| f.trim_matches('"').to_string())
+        })
+        .or_else(|| {
+            url.split('?').next()
+                .and_then(|u| u.rsplit('/').next())
+                .filter(|n| !n.is_empty())
+                .map(|n| n.to_string())
+        })
+        .unwrap_or_else(|| "download".into());
+
+    let bytes = response.bytes().map_err(|e| format!("Read body: {e}"))?;
+
+    if bytes.len() > MAX_DOWNLOAD_SIZE {
+        return Err(format!("File too large: {} bytes (max {})", bytes.len(), MAX_DOWNLOAD_SIZE));
+    }
+
+    let data_base64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let size = bytes.len();
+
+    tracing::info!(url = %url, mime = %mime, size, "URL fetched");
+
+    Ok(FetchUrlResult {
+        data_base64,
+        mime,
+        filename,
+        size,
+    })
 }
 
 // ---------------------------------------------------------------------------
