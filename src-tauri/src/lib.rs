@@ -4,9 +4,9 @@ pub mod error;
 pub mod storage;
 pub mod util;
 
-use storage::db::Database;
 use std::collections::HashMap;
 use std::sync::Mutex;
+use storage::db::Database;
 use tauri::Manager;
 
 /// Shared application state accessible from Tauri commands.
@@ -32,8 +32,7 @@ pub fn run() {
 
     tracing::info!("Himitsu starting up");
 
-    let db = Database::open_default()
-        .expect("Failed to open RocksDB database");
+    let db = Database::open_default().expect("Failed to open RocksDB database");
 
     tracing::info!(path = %db.path.display(), "Database opened");
 
