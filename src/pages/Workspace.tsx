@@ -152,6 +152,7 @@ export default function Workspace() {
 
   const [leftDragOver, setLeftDragOver] = useState(false);
   const [rightDragOver, setRightDragOver] = useState(false);
+  const [fullscreenPreview, setFullscreenPreview] = useState<PreviewData | null>(null);
 
   const nativeDropTime = useRef(0);
   const leftPanelRef = useRef<HTMLDivElement>(null);
@@ -488,8 +489,9 @@ export default function Workspace() {
 
                 {leftSingle ? (
                   <div
-                    style={{ cursor: leftSingle.path ? "grab" : "default", flex: 1, minHeight: 0, display: "flex", flexDirection: "column", justifyContent: hasPreview(leftSingle.preview) ? "flex-start" : "center", width: "100%" }}
+                    style={{ cursor: hasPreview(leftSingle.preview) ? "zoom-in" : leftSingle.path ? "grab" : "default", flex: 1, minHeight: 0, display: "flex", flexDirection: "column", justifyContent: hasPreview(leftSingle.preview) ? "flex-start" : "center", width: "100%" }}
                     onMouseDown={(e) => leftSingle.path && handleDragOut(e, [leftSingle])}
+                    onClick={() => hasPreview(leftSingle.preview) && setFullscreenPreview(leftSingle.preview)}
                   >
                     {hasPreview(leftSingle.preview) ? (
                       <InlinePreview data={leftSingle.preview!} />
@@ -586,6 +588,16 @@ export default function Workspace() {
           {busy ? "..." : `\u00AB Decrypt ${rightFiles.length > 1 ? `(${rightFiles.length})` : ""}`}
         </button>
       </div>
+
+      {/* Fullscreen preview modal */}
+      {fullscreenPreview && (
+        <div className="fullscreen-overlay" onClick={() => setFullscreenPreview(null)}>
+          <div className="fullscreen-content" onClick={(e) => e.stopPropagation()}>
+            <button className="fullscreen-close" onClick={() => setFullscreenPreview(null)}>x</button>
+            <InlinePreview data={fullscreenPreview} />
+          </div>
+        </div>
+      )}
 
       {/* Error dialog */}
       {dialog && (
