@@ -46,7 +46,11 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_drag::init())
+        .setup(|_app| {
+            #[cfg(not(target_os = "android"))]
+            _app.handle().plugin(tauri_plugin_drag::init())?;
+            Ok(())
+        })
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             // System
@@ -86,6 +90,10 @@ pub fn run() {
             commands::files::get_file_info,
             commands::files::save_temp_file,
             commands::files::fetch_url,
+            // Share (mobile)
+            commands::share::share_file,
+            commands::share::is_himitsu_file,
+            commands::share::is_himitsu_data,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {

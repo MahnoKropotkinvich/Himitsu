@@ -48,6 +48,11 @@ jobs:
             artifact: 'himitsu_*_arm64-setup.exe'
             artifact_dir: bundle/nsis
 
+          # ── Android ─────────────────────────────────────────────
+          - os: ubuntu-22.04
+            target: aarch64-linux-android
+            android: true
+
     runs-on: ${{ matrix.os }}
     name: Build (${{ matrix.target }})
 
@@ -83,7 +88,7 @@ jobs:
 
       # ── Linux system deps ──────────────────────────────────────
       - name: Linux system dependencies
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && !matrix.android
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -164,8 +169,87 @@ jobs:
           echo "GMP_LIB_DIR=$VCPKG_ROOT/installed/arm64-windows-static-md/lib" >> $GITHUB_ENV
           echo "INCLUDE=$VCPKG_ROOT/installed/arm64-windows-static-md/include" >> $GITHUB_ENV
 
-      # ── Build ─────────────────────────────────────────────────
-      - name: Build Tauri app
+      # ── Android system deps ─────────────────────────────────────
+      - name: Android system dependencies
+        if: matrix.android
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev m4
+
+      - name: Setup Java (Android)
+        if: matrix.android
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Android SDK (Android)
+        if: matrix.android
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-35 platforms;android-36 build-tools;35.0.0 build-tools;36.1.0 ndk;28.2.13676358'
+          accept-android-sdk-licenses: true
+
+      - name: Set Android env vars
+        if: matrix.android
+        shell: bash
+        run: |
+          echo "NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> $GITHUB_ENV
+
+      - name: Restore GMP cache (Android aarch64)
+        if: matrix.android
+        id: gmp-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/gmp-android-aarch64
+          key: gmp-6.3.0-aarch64-linux-android-ndk28c-v1
+
+      - name: Cross-compile GMP for Android aarch64
+        if: matrix.android && steps.gmp-cache.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          NDK=$ANDROID_HOME/ndk/28.2.13676358
+          TOOLCHAIN=$NDK/toolchains/llvm/prebuilt/linux-x86_64
+          export CC=$TOOLCHAIN/bin/aarch64-linux-android24-clang
+          export CXX=$TOOLCHAIN/bin/aarch64-linux-android24-clang++
+          export AR=$TOOLCHAIN/bin/llvm-ar
+          export RANLIB=$TOOLCHAIN/bin/llvm-ranlib
+          export STRIP=$TOOLCHAIN/bin/llvm-strip
+          PREFIX=/tmp/gmp-android-aarch64
+          mkdir -p $PREFIX
+          cd /tmp
+          curl -L -o gmp-6.3.0.tar.xz https://gmplib.org/download/gmp/gmp-6.3.0.tar.xz
+          tar xf gmp-6.3.0.tar.xz
+          cd gmp-6.3.0
+          ./configure \
+            --host=aarch64-linux-android \
+            --prefix=$PREFIX \
+            --disable-shared \
+            --enable-static
+          make -j$(nproc)
+          make install
+
+      - name: Save GMP cache (Android aarch64)
+        if: matrix.android && steps.gmp-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/gmp-android-aarch64
+          key: gmp-6.3.0-aarch64-linux-android-ndk28c-v1
+
+      - name: Set GMP env (Android)
+        if: matrix.android
+        shell: bash
+        run: |
+          echo "GMP_LIB_DIR=/tmp/gmp-android-aarch64/lib" >> $GITHUB_ENV
+          echo "GMP_INCLUDE_DIR=/tmp/gmp-android-aarch64/include" >> $GITHUB_ENV
+
+      - name: Init Tauri Android project
+        if: matrix.android
+        run: npx tauri android init
+
+      # ── Build (Desktop) ─────────────────────────────────────────
+      - name: Build Tauri app (Desktop)
+        if: "!matrix.android"
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -178,8 +262,14 @@ jobs:
           args: --target ${{ matrix.target }}
           tauriScript: npm run tauri
 
+      # ── Build (Android) ────────────────────────────────────────
+      - name: Build Tauri app (Android)
+        if: matrix.android
+        run: npx tauri android build --target aarch64
+
       # ── Upload artifacts ───────────────────────────────────────
       - name: Upload bundle
+        if: "!matrix.android"
         uses: actions/upload-artifact@v4
         with:
           name: himitsu-${{ matrix.target }}
@@ -187,7 +277,7 @@ jobs:
           retention-days: 30
 
       - name: Upload RPM (Linux only)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && !matrix.android
         uses: actions/upload-artifact@v4
         with:
           name: himitsu-${{ matrix.target }}-rpm
@@ -195,9 +285,17 @@ jobs:
           retention-days: 30
 
       - name: Upload AppImage (Linux only)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && !matrix.android
         uses: actions/upload-artifact@v4
         with:
           name: himitsu-${{ matrix.target }}-appimage
           path: src-tauri/target/${{ matrix.target }}/release/bundle/appimage/himitsu_*.AppImage
+          retention-days: 30
+
+      - name: Upload APK (Android)
+        if: matrix.android
+        uses: actions/upload-artifact@v4
+        with:
+          name: himitsu-android-aarch64
+          path: src-tauri/gen/android/app/build/outputs/apk/**/*.apk
           retention-days: 30

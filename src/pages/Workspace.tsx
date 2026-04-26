@@ -291,6 +291,105 @@ export default function Workspace() {
     };
   }, [fileFromMemory]);
 
+  // ---- Android share-received: auto detect ciphertext vs plaintext ----
+  useEffect(() => {
+    const unlisten = listen<Array<{ name: string; size: number; dataBase64: string }>>(
+      "share-received",
+      async (event) => {
+        const sharedFiles = event.payload;
+        if (!sharedFiles || sharedFiles.length === 0) return;
+
+        setBusy(true);
+        const ciphertexts: PaneFile[] = [];
+        const plaintexts: PaneFile[] = [];
+
+        for (const sf of sharedFiles) {
+          try {
+            const isHmt: boolean = await invoke("is_himitsu_data", { dataBase64: sf.dataBase64 });
+            const pf = fileFromMemory(sf.name, sf.size, "application/octet-stream", sf.dataBase64);
+            if (isHmt) {
+              ciphertexts.push(pf);
+            } else {
+              plaintexts.push(pf);
+            }
+          } catch (e) {
+            console.error("share-received:", e);
+          }
+        }
+
+        // Place files in appropriate panes
+        if (ciphertexts.length > 0) setRightFiles(prev => [...prev, ...ciphertexts]);
+        if (plaintexts.length > 0) setLeftFiles(prev => [...prev, ...plaintexts]);
+
+        // Auto-process: decrypt ciphertexts, encrypt plaintexts
+        if (ciphertexts.length > 0) {
+          try {
+            const decResults = await Promise.allSettled(ciphertexts.map(async (f): Promise<PaneFile | null> => {
+              if (!f.data) return null;
+              const result: DecryptResult = await invoke("decrypt_content", { ciphertextBase64: f.data });
+              const r = result.render;
+              const name = r.extension ? `decrypted.${r.extension}` : "decrypted";
+              const cat = r.category ? String(r.category) : "Binary";
+              return {
+                id: genId(), path: null, data: r.data_base64 || null,
+                name, size: result.size_bytes, isDir: false,
+                preview: { category: cat, preview_base64: r.data_base64 || null, preview_data_url: r.data_url || null },
+              };
+            }));
+            const decrypted = decResults
+              .filter((r): r is PromiseFulfilledResult<PaneFile | null> => r.status === "fulfilled")
+              .map(r => r.value)
+              .filter((v): v is PaneFile => v !== null);
+            if (decrypted.length > 0) setLeftFiles(prev => [...prev, ...decrypted]);
+          } catch (e) {
+            setDialog(`Auto-decrypt error: ${e}`);
+          }
+        }
+
+        if (plaintexts.length > 0) {
+          try {
+            const encResults = await Promise.allSettled(plaintexts.map(async (f): Promise<PaneFile | null> => {
+              if (!f.data) return null;
+              const result: EncryptFileResult = await invoke("encrypt_content", { dataBase64: f.data, filename: f.name || "shared" });
+              return {
+                id: genId(), path: result.output_path, data: null,
+                name: result.output_path.split(/[/\\]/).pop() || "encrypted.himitsu",
+                size: result.output_size, isDir: false, preview: null,
+              };
+            }));
+            const encrypted = encResults
+              .filter((r): r is PromiseFulfilledResult<PaneFile | null> => r.status === "fulfilled")
+              .map(r => r.value)
+              .filter((v): v is PaneFile => v !== null);
+            if (encrypted.length > 0) setRightFiles(prev => [...prev, ...encrypted]);
+          } catch (e) {
+            setDialog(`Auto-encrypt error: ${e}`);
+          }
+        }
+
+        setBusy(false);
+      }
+    );
+    return () => { unlisten.then(fn => fn()); };
+  }, [fileFromMemory]);
+
+  // ---- Share out (Android) ----
+  const handleShareOut = useCallback(async (file: PaneFile) => {
+    if (!file.path) {
+      setDialog("Cannot share in-memory files directly. Save the file first.");
+      return;
+    }
+    try {
+      const result: { success: boolean; message: string } = await invoke("share_file", {
+        filePath: file.path,
+        mimeType: null,
+      });
+      if (!result.success) setDialog(result.message);
+    } catch (e: any) {
+      setDialog(`Share failed: ${e}`);
+    }
+  }, []);
+
   // ---- File selection via dialog ----
   const selectLeft = async () => {
     const result = await open({ multiple: true, title: "Select plaintext file(s)" });
@@ -483,6 +582,9 @@ export default function Workspace() {
                   {leftSingle?.path && (
                     <button className="btn btn-outline btn-sm" onClick={(e) => { e.stopPropagation(); handleReveal(leftSingle.path!); }}>Reveal</button>
                   )}
+                  {leftSingle?.path && (
+                    <button className="btn btn-outline btn-sm" onClick={(e) => { e.stopPropagation(); handleShareOut(leftSingle); }}>Share</button>
+                  )}
                   <button className="btn btn-outline btn-sm" onClick={(e) => { e.stopPropagation(); selectLeft(); }}>Add</button>
                   <button className="btn btn-outline btn-sm" onClick={(e) => { e.stopPropagation(); clearLeft(); }}>Clear</button>
                 </div>
@@ -541,6 +643,7 @@ export default function Workspace() {
                     <>
                       <button className="btn btn-outline btn-sm" onClick={(e) => { e.stopPropagation(); handleSave(rightSingle.path!, rightSingle.name); }}>Save</button>
                       <button className="btn btn-outline btn-sm" onClick={(e) => { e.stopPropagation(); handleReveal(rightSingle.path!); }}>Reveal</button>
+                      <button className="btn btn-outline btn-sm" onClick={(e) => { e.stopPropagation(); handleShareOut(rightSingle); }}>Share</button>
                     </>
                   )}
                   {!rightSingle && rightFiles.some(f => f.path) && (

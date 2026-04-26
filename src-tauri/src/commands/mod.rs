@@ -5,3 +5,4 @@ pub mod receiver;
 pub mod encrypt;
 pub mod decrypt;
 pub mod files;
+pub mod share;

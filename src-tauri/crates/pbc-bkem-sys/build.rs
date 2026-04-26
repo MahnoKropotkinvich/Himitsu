@@ -82,9 +82,27 @@ fn main() {
         bindgen_builder = bindgen_builder.clang_arg(format!("-I{}", p.display()));
     }
 
-    // bindgen always uses libclang which understands __attribute__, but when
-    // targeting MSVC the default defines may differ; ensure compat just in case.
-    if is_msvc {
+    // --- Cross-compilation target hints for libclang ---
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target = env::var("TARGET").unwrap_or_default();
+
+    if target_os == "android" {
+        // Tell libclang we're targeting Android so it doesn't pick up
+        // host glibc headers from /usr/include.
+        bindgen_builder = bindgen_builder.clang_arg(format!("--target={}", target));
+
+        // Point to NDK sysroot for C standard library headers.
+        if let Ok(ndk_home) = env::var("NDK_HOME").or_else(|_| env::var("ANDROID_NDK_HOME")) {
+            let sysroot = PathBuf::from(&ndk_home)
+                .join("toolchains/llvm/prebuilt/linux-x86_64/sysroot");
+            if sysroot.exists() {
+                bindgen_builder = bindgen_builder
+                    .clang_arg(format!("--sysroot={}", sysroot.display()));
+            }
+        }
+    } else if is_msvc {
+        // bindgen always uses libclang which understands __attribute__, but when
+        // targeting MSVC the default defines may differ; ensure compat just in case.
         bindgen_builder = bindgen_builder
             .clang_arg("-D__attribute__(x)=")
             .clang_arg("-D_CRT_SECURE_NO_WARNINGS");
@@ -152,8 +170,13 @@ impl DepPaths {
         let mut include = Vec::new();
         let mut lib_search = Vec::new();
 
+        // Detect the *target* OS (not the host OS) for cross-compilation.
+        let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+        let is_android = target_os == "android";
+
         // 1. Environment overrides (set by CI or user) take priority.
-        //    GMP_INCLUDE_DIR / GMP_LIB_DIR — used by vcpkg on Windows.
+        //    GMP_INCLUDE_DIR / GMP_LIB_DIR — used by vcpkg on Windows
+        //    and by Android cross-compilation setups.
         if let Ok(dir) = env::var("GMP_INCLUDE_DIR") {
             include.push(PathBuf::from(dir));
         }
@@ -177,9 +200,10 @@ impl DepPaths {
             }
         }
 
-        // 2. Platform-specific well-known paths (Unix only).
-        //    On Windows these don't exist and would cause cl.exe to error.
-        if !cfg!(target_os = "windows") {
+        // 2. Platform-specific well-known paths.
+        //    - Skip entirely for Android (must use GMP_LIB_DIR / GMP_INCLUDE_DIR)
+        //    - Skip for Windows (these Unix paths don't exist)
+        if !is_android && target_os != "windows" {
             let unix_include = [
                 "/opt/homebrew/include",
                 "/usr/local/include",
@@ -214,8 +238,15 @@ impl DepPaths {
 // ---------------------------------------------------------------------------
 
 fn try_system_pbc(dep: &DepPaths) -> bool {
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+
+    // Android never has system PBC; skip pkg-config entirely.
+    if target_os == "android" {
+        return false;
+    }
+
     // pkg-config (Unix)
-    if !cfg!(target_os = "windows") {
+    if target_os != "windows" {
         if let Ok(status) = std::process::Command::new("pkg-config")
             .args(["--exists", "pbc"])
             .status()
