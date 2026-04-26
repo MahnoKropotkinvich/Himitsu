@@ -154,6 +154,19 @@ export default function Workspace() {
   const [rightDragOver, setRightDragOver] = useState(false);
 
   const nativeDropTime = useRef(0);
+  const leftPanelRef = useRef<HTMLDivElement>(null);
+  const rightPanelRef = useRef<HTMLDivElement>(null);
+
+  /** Detect which pane a screen coordinate falls in. Works for both row and column layouts. */
+  const detectPane = useCallback((x: number, y: number): "left" | "right" => {
+    const leftRect = leftPanelRef.current?.getBoundingClientRect();
+    if (leftRect) {
+      if (x >= leftRect.left && x <= leftRect.right && y >= leftRect.top && y <= leftRect.bottom) {
+        return "left";
+      }
+    }
+    return "right";
+  }, []);
 
   // ---- Build PaneFile from various sources ----
 
@@ -190,8 +203,8 @@ export default function Workspace() {
         }
         if (newFiles.length === 0) return;
 
-        const midX = window.innerWidth / 2;
-        if (event.payload.position.x < midX) {
+        const side = detectPane(event.payload.position.x, event.payload.position.y);
+        if (side === "left") {
           setLeftFiles(prev => [...prev, ...newFiles]);
         } else {
           setRightFiles(prev => [...prev, ...newFiles]);
@@ -199,7 +212,7 @@ export default function Workspace() {
       }
     );
     return () => { unlisten.then(fn => fn()); };
-  }, [fileFromPath]);
+  }, [fileFromPath, detectPane]);
 
   // ---- HTML5 drag-drop (for in-memory content like browser-dragged files) ----
   const handleDragOver = useCallback((e: React.DragEvent) => { e.preventDefault(); e.stopPropagation(); }, []);
@@ -257,8 +270,9 @@ export default function Workspace() {
 
       // Determine target pane by mouse position
       const mouseX = (window as any).__lastMouseX ?? 0;
-      const midX = window.innerWidth / 2;
-      if (mouseX < midX) {
+      const mouseY = (window as any).__lastMouseY ?? 0;
+      const side = detectPane(mouseX, mouseY);
+      if (side === "left") {
         setLeftFiles(prev => [...prev, ...newFiles]);
       } else {
         setRightFiles(prev => [...prev, ...newFiles]);
@@ -266,7 +280,7 @@ export default function Workspace() {
     };
 
     // Track mouse position for paste target
-    const trackMouse = (e: MouseEvent) => { (window as any).__lastMouseX = e.clientX; };
+    const trackMouse = (e: MouseEvent) => { (window as any).__lastMouseX = e.clientX; (window as any).__lastMouseY = e.clientY; };
 
     window.addEventListener("paste", handlePaste);
     window.addEventListener("mousemove", trackMouse);
@@ -443,7 +457,7 @@ export default function Workspace() {
     <div className="workspace">
       <div className="workspace-panels">
         {/* LEFT: Plaintext */}
-        <div className="panel panel-left">
+        <div className="panel panel-left" ref={leftPanelRef}>
           <div className="panel-label">
             Plaintext
             {leftFiles.length > 0 && <span className="panel-file-name">{leftFiles.length === 1 ? leftFiles[0].name : `${leftFiles.length} files`}</span>}
@@ -505,7 +519,7 @@ export default function Workspace() {
         </div>
 
         {/* RIGHT: Ciphertext */}
-        <div className="panel">
+        <div className="panel" ref={rightPanelRef}>
           <div className="panel-label">
             Ciphertext
             {rightFiles.length > 0 && <span className="panel-file-name">{rightFiles.length === 1 ? rightFiles[0].name : `${rightFiles.length} files`}</span>}
