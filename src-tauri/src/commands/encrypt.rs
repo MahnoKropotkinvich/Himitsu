@@ -39,7 +39,7 @@ fn encrypt_to_temp<R: std::io::Read>(
         return Err("No active slots in this namespace".into());
     }
 
-    let dir = std::env::temp_dir().join("himitsu");
+    let dir = state.temp_dir.join("himitsu");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let output_path = dir.join(format!("{}.himitsu", uuid::Uuid::new_v4()));
 

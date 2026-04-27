@@ -396,3 +396,22 @@ pub fn export_subscriber_key(
         .map_err(|e| format!("Failed to write key file: {e}"))?;
     Ok(())
 }
+
+/// Export a user's GPG-encrypted key to a temp file and return its path.
+/// Used on Android where the save-file dialog is not available.
+#[tauri::command]
+pub fn export_subscriber_key_temp(
+    user_id: String,
+    display_name: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<String, String> {
+    let db = state.db.lock().unwrap();
+    let blob = db.get_cf(CF_ENCRYPTED_KEYS, user_id.as_bytes())
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Encrypted key not found".to_string())?;
+    let safe_name = display_name.replace(|c: char| !c.is_alphanumeric() && c != '_' && c != '-', "_");
+    let tmp_path = state.temp_dir.join(format!("{safe_name}_key.pgp"));
+    std::fs::write(&tmp_path, &blob)
+        .map_err(|e| format!("Failed to write temp key file: {e}"))?;
+    Ok(tmp_path.to_string_lossy().to_string())
+}

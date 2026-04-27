@@ -187,14 +187,20 @@ jobs:
         if: matrix.android
         uses: android-actions/setup-android@v3
         with:
-          packages: 'platform-tools platforms;android-35 platforms;android-36 build-tools;35.0.0 build-tools;36.1.0 ndk;28.2.13676358'
+          packages: 'platform-tools platforms;android-34 build-tools;36.1.0 ndk;28.2.13676358'
           accept-android-sdk-licenses: true
 
       - name: Set Android env vars
         if: matrix.android
         shell: bash
         run: |
-          echo "NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> $GITHUB_ENV
+          NDK_HOME="$ANDROID_HOME/ndk/28.2.13676358"
+          TOOLCHAIN="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64"
+          echo "NDK_HOME=$NDK_HOME" >> $GITHUB_ENV
+          echo "$TOOLCHAIN/bin" >> $GITHUB_PATH
+          echo "$ANDROID_HOME/build-tools/36.1.0" >> $GITHUB_PATH
+          echo "TARGET_CC=$TOOLCHAIN/bin/aarch64-linux-android24-clang" >> $GITHUB_ENV
+          echo "TARGET_AR=$TOOLCHAIN/bin/llvm-ar" >> $GITHUB_ENV
 
       - name: Restore GMP cache (Android aarch64)
         if: matrix.android
@@ -202,7 +208,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: /tmp/gmp-android-aarch64
-          key: gmp-6.3.0-aarch64-linux-android-ndk28c-v1
+          key: gmp-6.3.0-aarch64-linux-android-ndk28c-v2
 
       - name: Cross-compile GMP for Android aarch64
         if: matrix.android && steps.gmp-cache.outputs.cache-hit != 'true'
@@ -218,7 +224,9 @@ jobs:
           PREFIX=/tmp/gmp-android-aarch64
           mkdir -p $PREFIX
           cd /tmp
-          curl -L -o gmp-6.3.0.tar.xz https://gmplib.org/download/gmp/gmp-6.3.0.tar.xz
+          curl -fL --retry 5 --retry-delay 5 -o gmp-6.3.0.tar.xz https://ftp.gnu.org/gnu/gmp/gmp-6.3.0.tar.xz \
+            || curl -fL --retry 5 --retry-delay 5 -o gmp-6.3.0.tar.xz https://gmplib.org/download/gmp/gmp-6.3.0.tar.xz
+          echo "a3c2b80201b89e68616f4ad30bc66aee4927c3ce50e33929ca819d5c43538898  gmp-6.3.0.tar.xz" | sha256sum -c -
           tar xf gmp-6.3.0.tar.xz
           cd gmp-6.3.0
           ./configure \
@@ -234,7 +242,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: /tmp/gmp-android-aarch64
-          key: gmp-6.3.0-aarch64-linux-android-ndk28c-v1
+          key: gmp-6.3.0-aarch64-linux-android-ndk28c-v2
 
       - name: Set GMP env (Android)
         if: matrix.android
@@ -242,10 +250,6 @@ jobs:
         run: |
           echo "GMP_LIB_DIR=/tmp/gmp-android-aarch64/lib" >> $GITHUB_ENV
           echo "GMP_INCLUDE_DIR=/tmp/gmp-android-aarch64/include" >> $GITHUB_ENV
-
-      - name: Init Tauri Android project
-        if: matrix.android
-        run: npx tauri android init
 
       # ── Build (Desktop) ─────────────────────────────────────────
       - name: Build Tauri app (Desktop)
@@ -266,6 +270,82 @@ jobs:
       - name: Build Tauri app (Android)
         if: matrix.android
         run: npx tauri android build --target aarch64
+
+      - name: Sign Android APK
+        if: matrix.android
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK_IN="src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk"
+          APK_ALIGNED="src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-aligned.apk"
+          APK_OUT="src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk"
+
+          if [ ! -f "$APK_IN" ]; then
+            echo "Android unsigned APK not found: $APK_IN" >&2
+            exit 1
+          fi
+
+          if [ -n "${ANDROID_KEYSTORE_BASE64:-}" ]; then
+            if [ -z "${ANDROID_KEY_ALIAS:-}" ] || [ -z "${ANDROID_KEYSTORE_PASSWORD:-}" ]; then
+              echo "ANDROID_KEY_ALIAS and ANDROID_KEYSTORE_PASSWORD are required when ANDROID_KEYSTORE_BASE64 is set" >&2
+              exit 1
+            fi
+            KEYSTORE="$RUNNER_TEMP/himitsu-release.keystore"
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$KEYSTORE"
+            KEY_ALIAS="$ANDROID_KEY_ALIAS"
+            STORE_PASS="$ANDROID_KEYSTORE_PASSWORD"
+            KEY_PASS="${ANDROID_KEY_PASSWORD:-$ANDROID_KEYSTORE_PASSWORD}"
+          elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            echo "Tagged Android releases require signing secrets: ANDROID_KEYSTORE_BASE64, ANDROID_KEY_ALIAS, ANDROID_KEYSTORE_PASSWORD, and optionally ANDROID_KEY_PASSWORD" >&2
+            exit 1
+          else
+            KEYSTORE="$RUNNER_TEMP/himitsu-debug.keystore"
+            KEY_ALIAS="androiddebugkey"
+            STORE_PASS="android"
+            KEY_PASS="android"
+            keytool -genkeypair \
+              -keystore "$KEYSTORE" \
+              -storepass "$STORE_PASS" \
+              -keypass "$KEY_PASS" \
+              -alias "$KEY_ALIAS" \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+          zipalign -f -p 4 "$APK_IN" "$APK_ALIGNED"
+          apksigner sign \
+            --ks "$KEYSTORE" \
+            --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass "pass:$STORE_PASS" \
+            --key-pass "pass:$KEY_PASS" \
+            --out "$APK_OUT" \
+            "$APK_ALIGNED"
+          apksigner verify --verbose "$APK_OUT"
+
+      - name: Upload Android APK to GitHub Release
+        if: matrix.android && startsWith(github.ref, 'refs/tags/')
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk"
+          if [ ! -f "$APK" ]; then
+            echo "Android APK not found: $APK" >&2
+            exit 1
+          fi
+
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --draft --title "Himitsu $GITHUB_REF_NAME" --notes "See the assets below to download this version of Himitsu."
+
+          gh release upload "$GITHUB_REF_NAME" "$APK#himitsu-${GITHUB_REF_NAME}-android-aarch64.apk" --clobber
 
       # ── Upload artifacts ───────────────────────────────────────
       - name: Upload bundle
@@ -297,5 +377,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: himitsu-android-aarch64
-          path: src-tauri/gen/android/app/build/outputs/apk/**/*.apk
+          path: src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk
           retention-days: 30

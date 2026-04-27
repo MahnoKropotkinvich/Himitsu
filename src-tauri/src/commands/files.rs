@@ -82,6 +82,15 @@ pub fn get_file_info(path: String) -> std::result::Result<FileInfo, String> {
     })
 }
 
+/// Read a file and return its content as base64.
+#[tauri::command]
+pub fn read_file_base64(path: String) -> std::result::Result<String, String> {
+    use base64::Engine;
+    let data = std::fs::read(&path)
+        .map_err(|e| format!("Cannot read file: {e}"))?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(&data))
+}
+
 /// Copy a temp file to a user-chosen destination.
 #[tauri::command]
 pub fn save_temp_file(

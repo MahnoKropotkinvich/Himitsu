@@ -72,6 +72,18 @@ interface PaneFile {
   extension?: string;
 }
 
+interface SharedAndroidFile {
+  name: string;
+  size: number;
+  dataBase64: string;
+  mimeType?: string;
+}
+
+interface WorkspaceProps {
+  pendingSharedFiles?: SharedAndroidFile[] | null;
+  onPendingSharedFilesConsumed?: () => void;
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -94,6 +106,8 @@ function guessCategoryFromMime(mime: string): string {
   if (mime.startsWith("text/") || mime === "application/json") return "Text";
   return "Binary";
 }
+
+const IS_ANDROID = /android/i.test(navigator.userAgent);
 
 function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -143,7 +157,7 @@ function PdfPreview({ base64 }: { base64: string }) {
 // Main component
 // ---------------------------------------------------------------------------
 
-export default function Workspace() {
+export default function Workspace({ pendingSharedFiles, onPendingSharedFilesConsumed }: WorkspaceProps) {
   const [leftFiles, setLeftFiles] = useState<PaneFile[]>([]);
   const [rightFiles, setRightFiles] = useState<PaneFile[]>([]);
 
@@ -157,6 +171,8 @@ export default function Workspace() {
   const nativeDropTime = useRef(0);
   const leftPanelRef = useRef<HTMLDivElement>(null);
   const rightPanelRef = useRef<HTMLDivElement>(null);
+  const leftInputRef = useRef<HTMLInputElement>(null);
+  const rightInputRef = useRef<HTMLInputElement>(null);
 
   /** Detect which pane a screen coordinate falls in. Works for both row and column layouts. */
   const detectPane = useCallback((x: number, y: number): "left" | "right" => {
@@ -291,107 +307,149 @@ export default function Workspace() {
     };
   }, [fileFromMemory]);
 
-  // ---- Android share-received: auto detect ciphertext vs plaintext ----
+  // ---- Android share processing requested by App-level router ----
   useEffect(() => {
-    const unlisten = listen<Array<{ name: string; size: number; dataBase64: string }>>(
-      "share-received",
-      async (event) => {
-        const sharedFiles = event.payload;
-        if (!sharedFiles || sharedFiles.length === 0) return;
+    const processSharedFiles = async (sharedFiles: SharedAndroidFile[]) => {
+      if (!sharedFiles || sharedFiles.length === 0) return;
 
-        setBusy(true);
-        const ciphertexts: PaneFile[] = [];
-        const plaintexts: PaneFile[] = [];
+      setBusy(true);
+      const ciphertexts: PaneFile[] = [];
+      const plaintexts: PaneFile[] = [];
 
-        for (const sf of sharedFiles) {
-          try {
-            const isHmt: boolean = await invoke("is_himitsu_data", { dataBase64: sf.dataBase64 });
-            const pf = fileFromMemory(sf.name, sf.size, "application/octet-stream", sf.dataBase64);
-            if (isHmt) {
-              ciphertexts.push(pf);
-            } else {
-              plaintexts.push(pf);
-            }
-          } catch (e) {
-            console.error("share-received:", e);
+      for (const sf of sharedFiles) {
+        try {
+          const isHmt: boolean = await invoke("is_himitsu_data", { dataBase64: sf.dataBase64 });
+          const pf = fileFromMemory(sf.name, sf.size, sf.mimeType || "application/octet-stream", sf.dataBase64);
+          if (isHmt) {
+            ciphertexts.push(pf);
+          } else {
+            plaintexts.push(pf);
           }
+        } catch (e) {
+          console.error("share-received:", e);
         }
-
-        // Place files in appropriate panes
-        if (ciphertexts.length > 0) setRightFiles(prev => [...prev, ...ciphertexts]);
-        if (plaintexts.length > 0) setLeftFiles(prev => [...prev, ...plaintexts]);
-
-        // Auto-process: decrypt ciphertexts, encrypt plaintexts
-        if (ciphertexts.length > 0) {
-          try {
-            const decResults = await Promise.allSettled(ciphertexts.map(async (f): Promise<PaneFile | null> => {
-              if (!f.data) return null;
-              const result: DecryptResult = await invoke("decrypt_content", { ciphertextBase64: f.data });
-              const r = result.render;
-              const name = r.extension ? `decrypted.${r.extension}` : "decrypted";
-              const cat = r.category ? String(r.category) : "Binary";
-              return {
-                id: genId(), path: null, data: r.data_base64 || null,
-                name, size: result.size_bytes, isDir: false,
-                preview: { category: cat, preview_base64: r.data_base64 || null, preview_data_url: r.data_url || null },
-              };
-            }));
-            const decrypted = decResults
-              .filter((r): r is PromiseFulfilledResult<PaneFile | null> => r.status === "fulfilled")
-              .map(r => r.value)
-              .filter((v): v is PaneFile => v !== null);
-            if (decrypted.length > 0) setLeftFiles(prev => [...prev, ...decrypted]);
-          } catch (e) {
-            setDialog(`Auto-decrypt error: ${e}`);
-          }
-        }
-
-        if (plaintexts.length > 0) {
-          try {
-            const encResults = await Promise.allSettled(plaintexts.map(async (f): Promise<PaneFile | null> => {
-              if (!f.data) return null;
-              const result: EncryptFileResult = await invoke("encrypt_content", { dataBase64: f.data, filename: f.name || "shared" });
-              return {
-                id: genId(), path: result.output_path, data: null,
-                name: result.output_path.split(/[/\\]/).pop() || "encrypted.himitsu",
-                size: result.output_size, isDir: false, preview: null,
-              };
-            }));
-            const encrypted = encResults
-              .filter((r): r is PromiseFulfilledResult<PaneFile | null> => r.status === "fulfilled")
-              .map(r => r.value)
-              .filter((v): v is PaneFile => v !== null);
-            if (encrypted.length > 0) setRightFiles(prev => [...prev, ...encrypted]);
-          } catch (e) {
-            setDialog(`Auto-encrypt error: ${e}`);
-          }
-        }
-
-        setBusy(false);
       }
-    );
-    return () => { unlisten.then(fn => fn()); };
-  }, [fileFromMemory]);
 
-  // ---- Share out (Android) ----
-  const handleShareOut = useCallback(async (file: PaneFile) => {
-    if (!file.path) {
-      setDialog("Cannot share in-memory files directly. Save the file first.");
-      return;
+      // Place files in appropriate panes
+      if (ciphertexts.length > 0) setRightFiles(prev => [...prev, ...ciphertexts]);
+      if (plaintexts.length > 0) setLeftFiles(prev => [...prev, ...plaintexts]);
+
+      // Auto-process: decrypt ciphertexts, encrypt plaintexts
+      if (ciphertexts.length > 0) {
+        try {
+          const decResults = await Promise.allSettled(ciphertexts.map(async (f): Promise<PaneFile | null> => {
+            if (!f.data) return null;
+            const result: DecryptResult = await invoke("decrypt_content", { ciphertextBase64: f.data });
+            const r = result.render;
+            const name = r.extension ? `decrypted.${r.extension}` : "decrypted";
+            const cat = r.category ? String(r.category) : "Binary";
+            return {
+              id: genId(), path: null, data: r.data_base64 || null,
+              name, size: result.size_bytes, isDir: false,
+              preview: { category: cat, preview_base64: r.data_base64 || null, preview_data_url: r.data_url || null },
+            };
+          }));
+          const decrypted = decResults
+            .filter((r): r is PromiseFulfilledResult<PaneFile | null> => r.status === "fulfilled")
+            .map(r => r.value)
+            .filter((v): v is PaneFile => v !== null);
+          if (decrypted.length > 0) setLeftFiles(prev => [...prev, ...decrypted]);
+        } catch (e) {
+          setDialog(`Auto-decrypt error: ${e}`);
+        }
+      }
+
+      if (plaintexts.length > 0) {
+        try {
+          const encResults = await Promise.allSettled(plaintexts.map(async (f): Promise<PaneFile | null> => {
+            if (!f.data) return null;
+            const result: EncryptFileResult = await invoke("encrypt_content", { dataBase64: f.data, filename: f.name || "shared" });
+            return {
+              id: genId(), path: result.output_path, data: null,
+              name: result.output_path.split(/[/\\]/).pop() || "encrypted.himitsu",
+              size: result.output_size, isDir: false, preview: null,
+            };
+          }));
+          const encrypted = encResults
+            .filter((r): r is PromiseFulfilledResult<PaneFile | null> => r.status === "fulfilled")
+            .map(r => r.value)
+            .filter((v): v is PaneFile => v !== null);
+          if (encrypted.length > 0) setRightFiles(prev => [...prev, ...encrypted]);
+        } catch (e) {
+          setDialog(`Auto-encrypt error: ${e}`);
+        }
+      }
+
+      setBusy(false);
+    };
+
+    const handleProcessRequested = (event: Event) => {
+      const sharedFiles = (event as CustomEvent<SharedAndroidFile[]>).detail;
+      void processSharedFiles(sharedFiles);
+    };
+
+    window.addEventListener("share-process-requested", handleProcessRequested);
+
+    if (pendingSharedFiles?.length) {
+      void processSharedFiles(pendingSharedFiles);
+      onPendingSharedFilesConsumed?.();
     }
+
+    return () => {
+      window.removeEventListener("share-process-requested", handleProcessRequested);
+    };
+  }, [fileFromMemory, pendingSharedFiles, onPendingSharedFilesConsumed]);
+
+  // ---- Android share helper: get base64 data from PaneFile ----
+  const getFileBase64 = useCallback(async (file: PaneFile): Promise<string | null> => {
+    if (file.data) return file.data;
+    if (file.path) return await invoke<string>("read_file_base64", { path: file.path });
+    return null;
+  }, []);
+
+  // ---- Share out ----
+  const handleShareOut = useCallback(async (file: PaneFile) => {
     try {
-      const result: { success: boolean; message: string } = await invoke("share_file", {
-        filePath: file.path,
-        mimeType: null,
-      });
-      if (!result.success) setDialog(result.message);
+      if (IS_ANDROID) {
+        const b64 = await getFileBase64(file);
+        if (!b64) { setDialog("No data to share."); return; }
+        (window as any).HimitsuBridge?.shareBase64(b64, file.name, "application/octet-stream");
+      } else if (file.path) {
+        const result: { success: boolean; message: string } = await invoke("share_file", {
+          filePath: file.path, mimeType: null,
+        });
+        if (!result.success) setDialog(result.message);
+      }
     } catch (e: any) {
       setDialog(`Share failed: ${e}`);
     }
-  }, []);
+  }, [getFileBase64]);
+
+  // ---- Browser file input handler (Android) ----
+  const handleBrowserFiles = useCallback(async (
+    e: React.ChangeEvent<HTMLInputElement>,
+    setter: React.Dispatch<React.SetStateAction<PaneFile[]>>,
+  ) => {
+    const fileList = e.target.files;
+    if (!fileList || fileList.length === 0) return;
+    const newFiles: PaneFile[] = [];
+    for (let i = 0; i < fileList.length; i++) {
+      const file = fileList[i];
+      const buf = await file.arrayBuffer();
+      const b64 = arrayBufferToBase64(buf);
+      const mime = file.type || "application/octet-stream";
+      newFiles.push(fileFromMemory(file.name, file.size, mime, b64));
+    }
+    if (newFiles.length > 0) setter(prev => [...prev, ...newFiles]);
+    e.target.value = ""; // reset so same file can be picked again
+  }, [fileFromMemory]);
 
   // ---- File selection via dialog ----
   const selectLeft = async () => {
+    if (IS_ANDROID) {
+      leftInputRef.current?.click();
+      return;
+    }
     const result = await open({ multiple: true, title: "Select plaintext file(s)" });
     if (!result) return;
     const paths = Array.isArray(result) ? result : [result];
@@ -403,6 +461,10 @@ export default function Workspace() {
   };
 
   const selectRight = async () => {
+    if (IS_ANDROID) {
+      rightInputRef.current?.click();
+      return;
+    }
     const result = await open({
       multiple: true,
       title: "Select ciphertext file(s)",
@@ -500,13 +562,31 @@ export default function Workspace() {
   };
 
   // ---- Save / Reveal ----
-  const handleSave = async (tempPath: string, defaultName: string) => {
-    const dest = await save({ title: "Save file", defaultPath: defaultName });
+  const handleSave = async (file: PaneFile) => {
+    if (IS_ANDROID) {
+      try {
+        const b64 = await getFileBase64(file);
+        if (!b64) { setDialog("No data to save."); return; }
+        (window as any).HimitsuBridge?.shareBase64(b64, file.originalName || file.name, "application/octet-stream");
+      } catch (e: any) { setDialog(`Export failed:\n${e}`); }
+      return;
+    }
+    if (!file.path && !file.tempPath) return;
+    const dest = await save({ title: "Save file", defaultPath: file.originalName || file.name });
     if (!dest) return;
-    try { await invoke("save_temp_file", { tempPath, destPath: dest }); } catch (e: any) { setDialog(`Save failed:\n${e}`); }
+    try { await invoke("save_temp_file", { tempPath: file.tempPath || file.path, destPath: dest }); } catch (e: any) { setDialog(`Save failed:\n${e}`); }
   };
 
   const handleSaveAll = async (files: PaneFile[]) => {
+    if (IS_ANDROID) {
+      for (const f of files) {
+        try {
+          const b64 = await getFileBase64(f);
+          if (b64) (window as any).HimitsuBridge?.shareBase64(b64, f.originalName || f.name, "application/octet-stream");
+        } catch (_) {}
+      }
+      return;
+    }
     const saveable = files.filter(f => f.path);
     if (saveable.length === 0) return;
     const dir = await open({ directory: true, title: "Select destination folder" });
@@ -555,6 +635,11 @@ export default function Workspace() {
   // ---- Render ----
   return (
     <div className="workspace">
+      {/* Hidden file inputs for Android */}
+      <input ref={leftInputRef} type="file" multiple style={{ display: "none" }}
+        onChange={(e) => handleBrowserFiles(e, setLeftFiles)} />
+      <input ref={rightInputRef} type="file" multiple style={{ display: "none" }}
+        onChange={(e) => handleBrowserFiles(e, setRightFiles)} />
       <div className="workspace-panels">
         {/* LEFT: Plaintext */}
         <div className="panel panel-left" ref={leftPanelRef}>
@@ -573,13 +658,13 @@ export default function Workspace() {
             {leftHasContent ? (
               <>
                 <div className="drop-zone-actions">
-                  {leftSingle?.tempPath && (
-                    <button className="btn btn-outline btn-sm" onClick={(e) => { e.stopPropagation(); handleSave(leftSingle.tempPath!, leftSingle.originalName || leftSingle.name); }}>Save</button>
+                  {(leftSingle?.tempPath || (IS_ANDROID && leftSingle?.data)) && (
+                    <button className="btn btn-outline btn-sm" onClick={(e) => { e.stopPropagation(); handleSave(leftSingle); }}>Save</button>
                   )}
                   {!leftSingle && leftFiles.some(f => f.path) && (
                     <button className="btn btn-outline btn-sm" onClick={(e) => { e.stopPropagation(); handleSaveAll(leftFiles); }}>Save All</button>
                   )}
-                  {leftSingle?.path && (
+                  {!IS_ANDROID && leftSingle?.path && (
                     <button className="btn btn-outline btn-sm" onClick={(e) => { e.stopPropagation(); handleReveal(leftSingle.path!); }}>Reveal</button>
                   )}
                   {leftSingle?.path && (
@@ -591,8 +676,8 @@ export default function Workspace() {
 
                 {leftSingle ? (
                   <div
-                    style={{ cursor: hasPreview(leftSingle.preview) ? "zoom-in" : leftSingle.path ? "grab" : "default", flex: 1, minHeight: 0, display: "flex", flexDirection: "column", justifyContent: hasPreview(leftSingle.preview) ? "flex-start" : "center", width: "100%" }}
-                    onMouseDown={(e) => leftSingle.path && handleDragOut(e, [leftSingle])}
+                    style={{ cursor: !IS_ANDROID && leftSingle.path ? "grab" : hasPreview(leftSingle.preview) ? "zoom-in" : "default", flex: 1, minHeight: 0, display: "flex", flexDirection: "column", justifyContent: hasPreview(leftSingle.preview) ? "flex-start" : "center", width: "100%" }}
+                    onMouseDown={(e) => !IS_ANDROID && leftSingle.path && handleDragOut(e, [leftSingle])}
                     onClick={() => hasPreview(leftSingle.preview) && setFullscreenPreview(leftSingle.preview)}
                   >
                     {hasPreview(leftSingle.preview) ? (
@@ -641,8 +726,8 @@ export default function Workspace() {
                 <div className="drop-zone-actions">
                   {rightSingle?.path && (
                     <>
-                      <button className="btn btn-outline btn-sm" onClick={(e) => { e.stopPropagation(); handleSave(rightSingle.path!, rightSingle.name); }}>Save</button>
-                      <button className="btn btn-outline btn-sm" onClick={(e) => { e.stopPropagation(); handleReveal(rightSingle.path!); }}>Reveal</button>
+                      <button className="btn btn-outline btn-sm" onClick={(e) => { e.stopPropagation(); handleSave(rightSingle); }}>Save</button>
+                      {!IS_ANDROID && <button className="btn btn-outline btn-sm" onClick={(e) => { e.stopPropagation(); handleReveal(rightSingle.path!); }}>Reveal</button>}
                       <button className="btn btn-outline btn-sm" onClick={(e) => { e.stopPropagation(); handleShareOut(rightSingle); }}>Share</button>
                     </>
                   )}
@@ -655,8 +740,8 @@ export default function Workspace() {
 
                 {rightSingle ? (
                   <div
-                    style={{ cursor: rightSingle.path ? "grab" : "default", flex: 1, minHeight: 0, display: "flex", flexDirection: "column", justifyContent: "center", width: "100%" }}
-                    onMouseDown={(e) => rightSingle.path && handleDragOut(e, [rightSingle])}
+                    style={{ cursor: !IS_ANDROID && rightSingle.path ? "grab" : "default", flex: 1, minHeight: 0, display: "flex", flexDirection: "column", justifyContent: "center", width: "100%" }}
+                    onMouseDown={(e) => !IS_ANDROID && rightSingle.path && handleDragOut(e, [rightSingle])}
                   >
                     <div className="binary-info">
                       <div className="binary-size">{formatBytes(rightSingle.size)}</div>

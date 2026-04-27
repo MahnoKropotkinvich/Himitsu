@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import type { PendingReceiverKey } from "../App";
 
 interface ReceiverKeyInfo {
   id: string;
@@ -10,9 +11,11 @@ interface ReceiverKeyInfo {
 
 interface Props {
   onKeyChanged: () => void;
+  pendingKey: PendingReceiverKey | null;
+  onPendingKeyConsumed: () => void;
 }
 
-export default function ReceiverSettings({ onKeyChanged }: Props) {
+export default function ReceiverSettings({ onKeyChanged, pendingKey, onPendingKeyConsumed }: Props) {
   const [keys, setKeys] = useState<ReceiverKeyInfo[]>([]);
   const [view, setView] = useState<"list" | "add">("list");
   const [status, setStatus] = useState<{ ok: boolean; msg: string } | null>(null);
@@ -23,6 +26,11 @@ export default function ReceiverSettings({ onKeyChanged }: Props) {
   };
 
   useEffect(() => { refresh(); }, []);
+
+  useEffect(() => {
+    if (!pendingKey) return;
+    setView("add");
+  }, [pendingKey]);
 
   const activate = async (key: ReceiverKeyInfo) => {
     try {
@@ -56,7 +64,12 @@ export default function ReceiverSettings({ onKeyChanged }: Props) {
   };
 
   if (view === "add") {
-    return <AddReceiverKey onBack={() => setView("list")} onAdded={handleAdded} />;
+    return <AddReceiverKey
+      onBack={() => setView("list")}
+      onAdded={handleAdded}
+      pendingKey={pendingKey}
+      onPendingKeyConsumed={onPendingKeyConsumed}
+    />;
   }
 
   return (
@@ -145,19 +158,36 @@ export default function ReceiverSettings({ onKeyChanged }: Props) {
 
 // ---- Add Key sub-view ----
 
-function AddReceiverKey({ onBack, onAdded }: { onBack: () => void; onAdded: () => void }) {
+function AddReceiverKey({ onBack, onAdded, pendingKey, onPendingKeyConsumed }: {
+  onBack: () => void;
+  onAdded: () => void;
+  pendingKey: PendingReceiverKey | null;
+  onPendingKeyConsumed: () => void;
+}) {
   const [label, setLabel] = useState("");
   const [gpgPrivKey, setGpgPrivKey] = useState("");
   const [passphrase, setPassphrase] = useState("");
   const [encryptedUsk, setEncryptedUsk] = useState<Uint8Array | null>(null);
+  const [encryptedUskSource, setEncryptedUskSource] = useState<string>("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (!pendingKey) return;
+    setEncryptedUsk(pendingKey.bytes);
+    setEncryptedUskSource(`Temporary shared file loaded: ${pendingKey.name}`);
+    setLabel((current) => current || pendingKey.name.replace(/\.(pgp|gpg|asc)$/i, ""));
+    onPendingKeyConsumed();
+  }, [pendingKey, onPendingKeyConsumed]);
 
   const handleFile = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
     const reader = new FileReader();
-    reader.onload = () => setEncryptedUsk(new Uint8Array(reader.result as ArrayBuffer));
+    reader.onload = () => {
+      setEncryptedUsk(new Uint8Array(reader.result as ArrayBuffer));
+      setEncryptedUskSource(`Loaded file: ${file.name}`);
+    };
     reader.readAsArrayBuffer(file);
   };
 
@@ -215,7 +245,7 @@ function AddReceiverKey({ onBack, onAdded }: { onBack: () => void; onAdded: () =
           <input type="file" onChange={handleFile} accept=".pgp,.gpg,.asc" />
           {encryptedUsk && (
             <p style={{ fontSize: 11, color: "var(--text2)", marginTop: 4 }}>
-              Loaded {encryptedUsk.length} bytes
+              {encryptedUskSource || "Loaded encrypted key"} ({encryptedUsk.length} bytes)
             </p>
           )}
         </div>

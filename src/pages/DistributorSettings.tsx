@@ -3,6 +3,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
 import type { NamespaceInfo } from "../App";
 
+const IS_ANDROID = /android/i.test(navigator.userAgent);
+
 interface Applicant {
   user_id: string;
   display_name: string;
@@ -116,14 +118,23 @@ export default function DistributorSettings({
 
   const downloadKey = async (user: Applicant) => {
     try {
-      const dest = await save({
-        title: "Save subscriber key",
-        defaultPath: `${user.display_name.replace(/\s+/g, "_")}_key.pgp`,
-        filters: [{ name: "PGP Encrypted Key", extensions: ["pgp"] }, { name: "All files", extensions: ["*"] }],
-      });
-      if (!dest) return;
-      await invoke("export_subscriber_key", { userId: user.user_id, destPath: dest });
-      setStatus({ ok: true, msg: `Key saved to ${dest}` });
+      if (IS_ANDROID) {
+        // Get key blob as bytes, convert to base64, share via bridge
+        const keyBytes: number[] = await invoke("download_subscriber_key", { userId: user.user_id });
+        const b64 = btoa(String.fromCharCode(...keyBytes));
+        const filename = `${user.display_name.replace(/\s+/g, "_")}_key.pgp`;
+        (window as any).HimitsuBridge?.shareBase64(b64, filename, "application/pgp-encrypted");
+        setStatus({ ok: true, msg: `Key shared for ${user.display_name}` });
+      } else {
+        const dest = await save({
+          title: "Save subscriber key",
+          defaultPath: `${user.display_name.replace(/\s+/g, "_")}_key.pgp`,
+          filters: [{ name: "PGP Encrypted Key", extensions: ["pgp"] }, { name: "All files", extensions: ["*"] }],
+        });
+        if (!dest) return;
+        await invoke("export_subscriber_key", { userId: user.user_id, destPath: dest });
+        setStatus({ ok: true, msg: `Key saved to ${dest}` });
+      }
     } catch (e: any) {
       setStatus({ ok: false, msg: `Export failed: ${e}` });
     }

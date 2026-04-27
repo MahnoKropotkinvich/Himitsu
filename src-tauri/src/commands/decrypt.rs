@@ -128,7 +128,7 @@ pub fn decrypt_file(
 
     // If the header says this is a folder, handle tar extraction
     if hdr.is_folder {
-        let dir = std::env::temp_dir().join("himitsu");
+        let dir = state.temp_dir.join("himitsu");
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
 
         let cursor = std::io::Cursor::new(&plaintext);
@@ -188,7 +188,7 @@ pub fn decrypt_file(
     };
 
     // Use original filename for temp file — no UUID prefix
-    let dir = std::env::temp_dir().join("himitsu");
+    let dir = state.temp_dir.join("himitsu");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let filename = match &original_name {
         Some(name) => name.clone(),
@@ -241,7 +241,7 @@ pub fn decrypt_to_folder(
     let (plaintext, hdr) = decrypt_from_reader(&mut reader, &state)?;
     let original_name = hdr.filename.clone();
 
-    let dir = std::env::temp_dir().join("himitsu");
+    let dir = state.temp_dir.join("himitsu");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
 
     let cursor = std::io::Cursor::new(&plaintext);

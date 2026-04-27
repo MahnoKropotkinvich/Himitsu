@@ -12,6 +12,7 @@ use tauri::Manager;
 /// Shared application state accessible from Tauri commands.
 pub struct AppState {
     pub db: Mutex<Database>,
+    pub temp_dir: std::path::PathBuf,
     pub temp_files: Mutex<Vec<std::path::PathBuf>>,
     /// Live BGW broadcast systems, keyed by namespace ID.
     /// Loaded on demand from RocksDB.
@@ -32,26 +33,51 @@ pub fn run() {
 
     tracing::info!("Himitsu starting up");
 
-    let db = Database::open_default().expect("Failed to open RocksDB database");
-
-    tracing::info!(path = %db.path.display(), "Database opened");
-
-    let state = AppState {
-        db: Mutex::new(db),
-        temp_files: Mutex::new(Vec::new()),
-        bgw: Mutex::new(HashMap::new()),
-        active_namespace: Mutex::new(None),
-    };
-
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .setup(|_app| {
+        .setup(|app| {
             #[cfg(not(target_os = "android"))]
-            _app.handle().plugin(tauri_plugin_drag::init())?;
+            app.handle().plugin(tauri_plugin_drag::init())?;
+
+            // Resolve the database path using Tauri's path resolver.
+            // On Android, dirs::data_local_dir() returns None, so we
+            // must use Tauri's app_data_dir() which maps to the app's
+            // private internal storage.
+            let app_data_dir = app.path().app_data_dir()
+                .unwrap_or_else(|_| {
+                    dirs::data_local_dir()
+                        .unwrap_or_else(|| std::path::PathBuf::from("."))
+                        .join("himitsu")
+                });
+            let db_path = app_data_dir
+                .join("db");
+
+            let temp_dir = app.path().app_cache_dir()
+                .unwrap_or_else(|_| app_data_dir.join("cache"))
+                .join("tmp");
+
+            std::fs::create_dir_all(&db_path)
+                .expect("Failed to create database directory");
+            std::fs::create_dir_all(&temp_dir)
+                .expect("Failed to create temporary directory");
+
+            let db = Database::open(&db_path)
+                .expect("Failed to open RocksDB database");
+
+            tracing::info!(path = %db.path.display(), "Database opened");
+
+            let state = AppState {
+                db: Mutex::new(db),
+                temp_dir,
+                temp_files: Mutex::new(Vec::new()),
+                bgw: Mutex::new(HashMap::new()),
+                active_namespace: Mutex::new(None),
+            };
+
+            app.manage(state);
             Ok(())
         })
-        .manage(state)
         .invoke_handler(tauri::generate_handler![
             // System
             commands::system::ensure_initialized,
@@ -70,6 +96,7 @@ pub fn run() {
             commands::subscribers::delete_subscriber,
             commands::subscribers::download_subscriber_key,
             commands::subscribers::export_subscriber_key,
+            commands::subscribers::export_subscriber_key_temp,
             commands::subscribers::get_ledger_entries,
             commands::subscribers::search_ledger,
             // Receiver
@@ -88,6 +115,7 @@ pub fn run() {
             commands::decrypt::decrypt_to_folder,
             // Files
             commands::files::get_file_info,
+            commands::files::read_file_base64,
             commands::files::save_temp_file,
             commands::files::fetch_url,
             // Share (mobile)
